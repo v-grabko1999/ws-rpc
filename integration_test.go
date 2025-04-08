@@ -14,6 +14,8 @@ import (
 	"github.com/v-grabko1999/ws-rpc/wetsock"
 )
 
+const testKey = "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq" // 32 'q'
+
 // Глобальные переменные
 var stopServer sync.Once
 var stopChan chan struct{}
@@ -77,7 +79,10 @@ func TestBidirectionalRPC(t *testing.T) {
 		registry.RegisterService(&ServerService{})
 
 		// Создаём RPC endpoint
-		endpoint := wetsock.NewEndpoint(registry, conn)
+		endpoint, err := wetsock.NewEndpoint(registry, conn, testKey)
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		wg.Add(1)
 		go func() {
@@ -108,7 +113,10 @@ func TestBidirectionalRPC(t *testing.T) {
 	clientRegistry := wsrpc.NewRegistry()
 	clientRegistry.RegisterService(&ClientService{})
 
-	client = wetsock.NewEndpoint(clientRegistry, conn)
+	client, err = wetsock.NewEndpoint(clientRegistry, conn, testKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()

@@ -1,8 +1,12 @@
 package wetsock
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"reflect"
 	"sync"
@@ -13,16 +17,11 @@ import (
 	wsrpc "github.com/v-grabko1999/ws-rpc"
 )
 
-type codec struct {
-	WS        *websocket.Conn
-	sendChan  chan *wsrpc.Message // Буфер для отправки сообщений
-	mu        sync.Mutex          // Защита от гонок при записи в WebSocket
-	closeOnce sync.Once           // Гарантия однократного закрытия
-	wg        sync.WaitGroup      // Гарантия отправки всех сообщений перед закрытием
-	closing   bool                // Флаг закрытия соединения
-}
+// ----------------------------------------------------------------------------
+// Допоміжні структури
+// ----------------------------------------------------------------------------
 
-// jsonMessage используется для десериализации сообщений
+// jsonMessage використовується для первинної десеріалізації після дешифрування
 type jsonMessage struct {
 	ID     uint64          `json:"id,string,omitempty"`
 	Func   string          `json:"fn,omitempty"`
@@ -31,13 +30,74 @@ type jsonMessage struct {
 	Error  *wsrpc.Error    `json:"error"`
 }
 
-// ReadMessage читает JSON-сообщение из WebSocket
-func (c *codec) ReadMessage(msg *wsrpc.Message) error {
-	var jm jsonMessage
-	err := c.WS.ReadJSON(&jm)
+// ----------------------------------------------------------------------------
+// Наш розширений codec
+// ----------------------------------------------------------------------------
 
+type codec struct {
+	WS        *websocket.Conn
+	sendChan  chan []byte // Зверніть увагу: зберігаємо зашифровані дані ([]byte)
+	mu        sync.Mutex
+	closeOnce sync.Once
+	wg        sync.WaitGroup
+	closing   bool
+
+	// Поля для AES-GCM
+	block cipher.Block
+	gcm   cipher.AEAD
+}
+
+// ----------------------------------------------------------------------------
+// Допоміжні функції для шифрування
+// ----------------------------------------------------------------------------
+
+func newAESGCM(key []byte) (cipher.Block, cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
 	if err != nil {
-		// Проверяем код ошибки WebSocket закрытия
+		return nil, nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, nil, err
+	}
+	return block, gcm, nil
+}
+
+// encryptMessage шифрує (AES-GCM) plain []byte → encrypted []byte (nonce + ciphertext + auth tag)
+func (c *codec) encryptMessage(plaintext []byte) ([]byte, error) {
+	nonce := make([]byte, c.gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	// GCM «зашиває» тег аутентичності у ciphertext
+	ciphertext := c.gcm.Seal(nonce, nonce, plaintext, nil)
+	return ciphertext, nil
+}
+
+// decryptMessage розшифровує []byte (nonce + ciphertext + tag) → plain []byte
+func (c *codec) decryptMessage(ciphertext []byte) ([]byte, error) {
+	nonceSize := c.gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, errors.New("ciphertext is too short")
+	}
+	nonce := ciphertext[:nonceSize]
+	data := ciphertext[nonceSize:]
+	plaintext, err := c.gcm.Open(nil, nonce, data, nil)
+	if err != nil {
+		return nil, err
+	}
+	return plaintext, nil
+}
+
+// ----------------------------------------------------------------------------
+// Методи, що вимагає wsrpc.Codec
+// ----------------------------------------------------------------------------
+
+// ReadMessage: читаємо бінарні дані, дешифруємо, потім розбираємо JSON
+func (c *codec) ReadMessage(msg *wsrpc.Message) error {
+	mt, data, err := c.WS.ReadMessage()
+	if err != nil {
+		// Перевірка закриття
 		if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 			log.Println("[WebSocket] Соединение закрыто:", err)
 			return err
@@ -45,8 +105,25 @@ func (c *codec) ReadMessage(msg *wsrpc.Message) error {
 		log.Println("[WebSocket] Ошибка чтения сообщения:", err)
 		return err
 	}
+	if mt != websocket.BinaryMessage {
+		return errors.New("ожидался бинарный шифрованный формат, а пришел другой тип")
+	}
 
-	// Заполняем структуру сообщения
+	// Дешифруємо
+	decrypted, err := c.decryptMessage(data)
+	if err != nil {
+		log.Println("[WebSocket] Ошибка дешифрования:", err)
+		return err
+	}
+
+	// Розбираємо JSON
+	var jm jsonMessage
+	if err := json.Unmarshal(decrypted, &jm); err != nil {
+		log.Println("[WebSocket] Ошибка парсинга JSON:", err)
+		return err
+	}
+
+	// Заповнюємо wsrpc.Message
 	msg.ID = jm.ID
 	msg.Func = jm.Func
 	msg.Args = jm.Args
@@ -55,7 +132,7 @@ func (c *codec) ReadMessage(msg *wsrpc.Message) error {
 	return nil
 }
 
-// WriteMessage отправляет сообщение в `sendChan`, но не принимает новые после закрытия
+// WriteMessage: серіалізуємо msg у JSON, шифруємо й відправляємо в канал
 func (c *codec) WriteMessage(msg *wsrpc.Message) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -65,61 +142,54 @@ func (c *codec) WriteMessage(msg *wsrpc.Message) error {
 		return errors.New("соединение закрывается, отправка невозможна")
 	}
 
-	// Добавляем сообщение в очередь и увеличиваем счетчик отправок
+	// 1) Спочатку серіалізуємо у JSON
+	rawJSON, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	// 2) Шифруємо
+	encrypted, err := c.encryptMessage(rawJSON)
+	if err != nil {
+		return err
+	}
+
+	// 3) Кладемо зашифровані дані у sendChan
 	c.wg.Add(1)
 	select {
-	case c.sendChan <- msg:
+	case c.sendChan <- encrypted:
 		return nil
-	case <-time.After(2 * time.Second): // Таймаут на отправку
+	case <-time.After(2 * time.Second):
+		c.wg.Done()
 		log.Println("[WebSocket] Таймаут отправки сообщения!")
-		c.wg.Done() // Сбрасываем счетчик, так как сообщение не отправлено
 		return errors.New("таймаут отправки сообщения")
 	}
 }
 
-// sendLoop - горутина, отправляющая сообщения из `sendChan`
-func (c *codec) sendLoop() {
-	for msg := range c.sendChan {
-		c.mu.Lock()
-		err := c.WS.WriteJSON(msg)
-		c.mu.Unlock()
-
-		if err != nil {
-			log.Println("[WebSocket] Ошибка при отправке сообщения:", err)
-			break
-		}
-		// Отмечаем, что сообщение успешно отправлено
-		c.wg.Done()
-	}
-}
-
-// Close корректно завершает WebSocket-соединение
+// Close: закриваємо з'єднання коректно
 func (c *codec) Close() error {
 	var err error
-
 	c.closeOnce.Do(func() {
 		log.Println("[WebSocket] Начато закрытие соединения...")
 
-		// Блокируем новые отправки
+		// Блокуємо нові відправлення
 		c.mu.Lock()
 		c.closing = true
 		c.mu.Unlock()
 
-		// Дожидаемся, пока все сообщения из очереди будут отправлены
+		// Дочікуємося всіх відправлень
 		log.Println("[WebSocket] Ожидание завершения всех отправок...")
 		c.wg.Wait()
 
-		// Отправляем CloseMessage перед закрытием
+		// Відправляємо "CloseMessage"
 		closeMessage := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Закрытие соединения")
 		err = c.WS.WriteMessage(websocket.CloseMessage, closeMessage)
 		if err != nil {
 			log.Println("[WebSocket] Ошибка при отправке CloseMessage:", err)
 		}
-
-		// Даем немного времени перед разрывом соединения
 		time.Sleep(100 * time.Millisecond)
 
-		// Закрываем WebSocket-соединение
+		// Закриваємо WebSocket
 		err = c.WS.Close()
 		if err != nil {
 			log.Println("[WebSocket] Ошибка при закрытии WebSocket:", err)
@@ -127,13 +197,17 @@ func (c *codec) Close() error {
 			log.Println("[WebSocket] Клиент успешно отключен")
 		}
 
-		// Закрываем канал отправки
+		// Закриваємо канал
 		close(c.sendChan)
 	})
 	return err
 }
 
-// UnmarshalArgs десериализует аргументы RPC-вызова
+// ----------------------------------------------------------------------------
+// Додаткові методи (потрібні інтерфейсу wsrpc.Codec)
+// ----------------------------------------------------------------------------
+
+// UnmarshalArgs десеріалізує msg.Args -> ваші аргументи
 func (c *codec) UnmarshalArgs(msg *wsrpc.Message, args interface{}) error {
 	raw, ok := msg.Args.(json.RawMessage)
 	if !ok || raw == nil {
@@ -146,7 +220,7 @@ func (c *codec) UnmarshalArgs(msg *wsrpc.Message, args interface{}) error {
 	return err
 }
 
-// UnmarshalResult десериализует результат RPC-вызова
+// UnmarshalResult десеріалізує msg.Result -> змінна result
 func (c *codec) UnmarshalResult(msg *wsrpc.Message, result interface{}) error {
 	raw, ok := msg.Result.(json.RawMessage)
 	if !ok || raw == nil {
@@ -159,7 +233,7 @@ func (c *codec) UnmarshalResult(msg *wsrpc.Message, result interface{}) error {
 	return err
 }
 
-// FillArgs заполняет аргументы вызова, если требуется передать WebSocket-соединение
+// FillArgs якщо в RPC-методах передбачено *websocket.Conn, замінює аргумент
 func (c *codec) FillArgs(arglist []reflect.Value) error {
 	for i := 0; i < len(arglist); i++ {
 		if _, ok := arglist[i].Interface().(*websocket.Conn); ok {
@@ -169,22 +243,59 @@ func (c *codec) FillArgs(arglist []reflect.Value) error {
 	return nil
 }
 
-// NewCodec создает новый экземпляр кодека с WebSocket-соединением
-func NewCodec(ws *websocket.Conn) *codec {
-	c := &codec{
-		WS:       ws,
-		sendChan: make(chan *wsrpc.Message, 100), // Буфер на 100 сообщений
+// ----------------------------------------------------------------------------
+// sendLoop: відправляємо з каналу зашифрований payload
+// ----------------------------------------------------------------------------
+func (c *codec) sendLoop() {
+	for encryptedPayload := range c.sendChan {
+		c.mu.Lock()
+		err := c.WS.WriteMessage(websocket.BinaryMessage, encryptedPayload)
+		c.mu.Unlock()
+
+		if err != nil {
+			log.Println("[WebSocket] Ошибка при отправке сообщения:", err)
+			// Якщо відправка зламалась, є сенс припинити або дати break
+			break
+		}
+		c.wg.Done()
 	}
-
-	// Запускаем горутину для обработки отправки сообщений
-	go c.sendLoop()
-
-	return c
 }
 
-// NewEndpoint создает новый Endpoint для WebSocket
-func NewEndpoint(registry *wsrpc.Registry, ws *websocket.Conn) *wsrpc.Endpoint {
-	c := NewCodec(ws)
+// ----------------------------------------------------------------------------
+// Фабрика для створення зашифрованого codec
+// ----------------------------------------------------------------------------
+
+// NewCodec створює codec, приймаючи ключ як рядок
+func NewCodec(ws *websocket.Conn, keyString string) (*codec, error) {
+	// Припустимо, що нам потрібні рівно 32 байти (AES-256).
+	key := []byte(keyString)
+	if len(key) != 32 {
+		return nil, errors.New("ключ повинен мати 32 байти довжини (AES-256)")
+	}
+
+	block, gcm, err := newAESGCM(key)
+	if err != nil {
+		return nil, err
+	}
+
+	c := &codec{
+		WS:       ws,
+		sendChan: make(chan []byte, 100),
+		block:    block,
+		gcm:      gcm,
+	}
+	// Запускаємо горутину відправлення
+	go c.sendLoop()
+
+	return c, nil
+}
+
+// NewEndpoint створює Endpoint для WebSocket з увімкненим шифруванням
+func NewEndpoint(registry *wsrpc.Registry, ws *websocket.Conn, keyString string) (*wsrpc.Endpoint, error) {
+	c, err := NewCodec(ws, keyString)
+	if err != nil {
+		return nil, err
+	}
 	e := wsrpc.NewEndpoint(c, registry)
-	return e
+	return e, nil
 }

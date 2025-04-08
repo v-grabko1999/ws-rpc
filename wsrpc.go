@@ -30,12 +30,12 @@ type function struct {
 	reply    reflect.Type
 }
 
-// Registry is a collection of services have methods that can be called remotely.
-// Each method has a name in the format SERVICE.METHOD.
+// Registry — це набір сервісів з методами, які можна викликати віддалено.
+// Кожен метод має назву у форматі SERVICE.METHOD.
 //
-// A single Registry is intended to be used with multiple Endpoints.
-// This separation exists as registering services can be a slow
-// operation.
+// Один реєстр (Registry) призначений для використання з кількома Endpoints.
+// Це розділення існує тому, що реєстрація сервісів може бути повільною операцією.
+
 type Registry struct {
 	// protects services
 	mu        sync.RWMutex
@@ -80,21 +80,22 @@ func getRPCMethodsOfType(object interface{}) ([]*function, error) {
 	return fns, nil
 }
 
-// RegisterService registers all exported methods of service, allowing
-// them to be called remotely. The name of the methods will be of the
-// format SERVICE.METHOD, where SERVICE is the type name or the object
-// passed in, and METHOD is the name of each method.
+// RegisterService реєструє всі експортовані методи service, дозволяючи
+// викликати їх віддалено. Імена методів матимуть формат SERVICE.METHOD,
+// де SERVICE — це назва типу або об’єкта, переданого при реєстрації,
+// а METHOD — назва кожного методу.
 //
-// The methods are expect to have at least two arguments, referred to
-// as args and reply. Reply should be a pointer type, and the method
-// should fill it with the result. The types used are limited only by
-// the codec needing to be able to marshal them for transport. For
-// example, for wetsock the args and reply must marshal to JSON.
+// Очікується, що методи мають щонайменше два аргументи — args та reply.
+// Reply має бути вказівником, і метод повинен заповнити його результатом.
+// Типи аргументів обмежені лише вимогами codec щодо можливості їх серіалізації
+// для передачі. Наприклад, для wetsock аргументи та відповідь мають
+// серіалізуватись у JSON.
 //
-// Rest of the arguments are filled on best-effort basis, if their
-// types are known to wsrpc and the codec in use.
+// Решта аргументів заповнюється за можливості, якщо їх типи відомі wsrpc
+// та використовуваному codec.
 //
-// The methods should have return type error.
+// Методи повинні повертати значення типу error.
+
 func (r *Registry) RegisterService(object interface{}) {
 	methods, err := getRPCMethodsOfType(object)
 	if err != nil {
@@ -120,13 +121,13 @@ func NewRegistry() *Registry {
 	return r
 }
 
-// A Codec reads messages from the peer, and writes messages to the
-// peer.
+// Codec читає повідомлення від вузла та записує повідомлення до вузла.
 type Codec interface {
 	ReadMessage(*Message) error
 
-	// WriteMessage may be called concurrently. Codecs need to
-	// protect themselves.
+	// WriteMessage може викликатися одночасно з різних потоків.
+	// Codec повинен самостійно забезпечити потокобезпечність.
+
 	WriteMessage(*Message) error
 
 	UnmarshalArgs(msg *Message, args interface{}) error
@@ -135,20 +136,19 @@ type Codec interface {
 	Close() error
 }
 
-// FillArgser is an optional interface that a Codec may implement, in
-// order to provide extra information to the RPC methods.
+// FillArgser — це необов’язковий інтерфейс, який може реалізувати Codec,
+// щоб надати додаткову інформацію методам RPC.
 //
-// The Codec should loop over the values, and fill whatever types it
-// recognizes.
+// Codec повинен перебирати значення і заповнювати ті типи, які він розпізнає.
 //
-// A typical use would be allowing the RPC method to see the
-// underlying connection, to retrieve the IP address of the peer.
+// Типовим прикладом використання є надання RPC-методу доступу до
+// базового з’єднання, щоб отримати IP-адресу віддаленого вузла.
 type FillArgser interface {
 	FillArgs([]reflect.Value) error
 }
 
-// Endpoint manages the state for one connection (via a Codec) and the
-// pending calls on it, both incoming and outgoing.
+// Endpoint керує станом одного з'єднання (через Codec) та обробляє
+// очікуючі виклики — як вхідні, так і вихідні.
 type Endpoint struct {
 	codec Codec
 
@@ -165,13 +165,14 @@ type Endpoint struct {
 	}
 }
 
-// Dummy registry with no functions registered.
+// Пустий реєстр без зареєстрованих функцій.
 var dummyRegistry = NewRegistry()
 
-// NewEndpoint creates a new endpoint that uses codec to talk to a
-// peer. To actually process messages, call endpoint.Serve; this is
-// done so you can capture errors. Registry can be nil to serve no
-// callables from this peer.
+// NewEndpoint створює нову кінцеву точку, яка використовує codec для взаємодії з вузлом.
+// Щоб обробляти повідомлення, потрібно викликати endpoint.Serve;
+// це зроблено для того, щоб можна було обробити помилки.
+// Registry може бути nil, якщо не потрібно надавати callable-об'єкти з цього вузла.
+
 func NewEndpoint(codec Codec, registry *Registry) *Endpoint {
 	if registry == nil {
 		registry = dummyRegistry
@@ -194,7 +195,7 @@ func (e *Endpoint) serve_request(msg *Message) error {
 		msg.Result = nil
 		err := e.send(msg)
 		if err != nil {
-			// well, we can't report the problem to the client...
+			// ну що ж, ми не можемо повідомити клієнту про проблему...
 			return err
 		}
 		return nil
@@ -229,7 +230,7 @@ func (e *Endpoint) serve_response(msg *Message) error {
 		call.Error = rpc.ServerError(msg.Error.Msg)
 	}
 
-	// notify the caller, but never block
+	// повідомити викликача, але ніколи не блокувати виконання
 	select {
 	case call.Done <- call:
 	default:
@@ -238,8 +239,8 @@ func (e *Endpoint) serve_response(msg *Message) error {
 	return nil
 }
 
-// Serve messages from this connection. Serve blocks, serving the
-// connection until the client disconnects, or there is an error.
+// Обробляє повідомлення з цього з'єднання. Serve блокує виконання,
+// обслуговуючи з'єднання до моменту, поки клієнт не відключиться або не виникне помилка.
 func (e *Endpoint) Serve() error {
 	defer e.codec.Close()
 	defer e.server.running.Wait()
@@ -369,7 +370,7 @@ func (e *Endpoint) call(fn *function, msg *Message) {
 	}
 }
 
-// Go invokes the function asynchronously. See net/rpc Client.Go.
+// Go викликає функцію асинхронно. Дивись net/rpc Client.Go.
 func (e *Endpoint) Go(function string, args interface{}, reply interface{}, done chan *rpc.Call) *rpc.Call {
 	call := &rpc.Call{}
 	call.ServiceMethod = function
