@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/klauspost/compress/zstd"
 
 	wsrpc "github.com/v-grabko1999/ws-rpc"
 )
@@ -65,12 +66,18 @@ func newAESGCM(key []byte) (cipher.Block, cipher.AEAD, error) {
 
 // encryptMessage шифрує (AES-GCM) plain []byte → encrypted []byte (nonce + ciphertext + auth tag)
 func (c *codec) encryptMessage(plaintext []byte) ([]byte, error) {
+	// стискаємо дані
+	enc := zstdEncoderPool.Get().(*zstd.Encoder)
+	defer zstdEncoderPool.Put(enc)
+
+	compressed := enc.EncodeAll(plaintext, nil)
+
 	nonce := make([]byte, c.gcm.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return nil, err
 	}
-	// GCM «зашиває» тег аутентичності у ciphertext
-	ciphertext := c.gcm.Seal(nonce, nonce, plaintext, nil)
+
+	ciphertext := c.gcm.Seal(nonce, nonce, compressed, nil)
 	return ciphertext, nil
 }
 
@@ -82,10 +89,21 @@ func (c *codec) decryptMessage(ciphertext []byte) ([]byte, error) {
 	}
 	nonce := ciphertext[:nonceSize]
 	data := ciphertext[nonceSize:]
-	plaintext, err := c.gcm.Open(nil, nonce, data, nil)
+
+	compressed, err := c.gcm.Open(nil, nonce, data, nil)
 	if err != nil {
 		return nil, err
 	}
+
+	dec := zstdDecoderPool.Get().(*zstd.Decoder)
+	defer zstdDecoderPool.Put(dec)
+
+	// розпакування
+	plaintext, err := dec.DecodeAll(compressed, nil)
+	if err != nil {
+		return nil, err
+	}
+
 	return plaintext, nil
 }
 
@@ -166,41 +184,75 @@ func (c *codec) WriteMessage(msg *wsrpc.Message) error {
 	}
 }
 
-// Close: закриваємо з'єднання коректно
+// ----------------------------------------------------------------------------
+// sendLoop: відправляємо з каналу зашифрований payload
+// ----------------------------------------------------------------------------
+func (c *codec) sendLoop() {
+	for {
+		payload, ok := <-c.sendChan
+		if !ok {
+			// Канал закритий — завершуємо sendLoop
+			return
+		}
+
+		c.mu.Lock()
+		err := c.WS.WriteMessage(websocket.BinaryMessage, payload)
+		c.mu.Unlock()
+
+		// Завжди відмічаємо завершення відправки (успішної чи ні)
+		c.wg.Done()
+
+		if err != nil {
+			log.Println("[WebSocket] Ошибка при отправке сообщения:", err)
+			// Після помилки дренуємо решту, щоб уникнути дедлоку
+			for range c.sendChan {
+				c.wg.Done()
+			}
+			return
+		}
+	}
+}
+
 func (c *codec) Close() error {
-	var err error
+	var closeErr error
+
 	c.closeOnce.Do(func() {
 		log.Println("[WebSocket] Начато закрытие соединения...")
 
-		// Блокуємо нові відправлення
+		// Забороняємо нові надсилання
 		c.mu.Lock()
 		c.closing = true
 		c.mu.Unlock()
 
-		// Дочікуємося всіх відправлень
+		// Закриваємо канал, щоб sendLoop почав дренувати / завершуватися
+		close(c.sendChan)
+
+		// Чекаємо, поки всі відправки (і дренування) завершаться
 		log.Println("[WebSocket] Ожидание завершения всех отправок...")
 		c.wg.Wait()
 
-		// Відправляємо "CloseMessage"
-		closeMessage := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Закрытие соединения")
-		err = c.WS.WriteMessage(websocket.CloseMessage, closeMessage)
-		if err != nil {
+		// Відправляємо фрейм закриття
+		closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Закрытие соединения")
+		if err := c.WS.WriteMessage(websocket.CloseMessage, closeMsg); err != nil {
 			log.Println("[WebSocket] Ошибка при отправке CloseMessage:", err)
+			closeErr = err
 		}
+
+		// Невелика затримка для надійності
 		time.Sleep(100 * time.Millisecond)
 
-		// Закриваємо WebSocket
-		err = c.WS.Close()
-		if err != nil {
+		// І нарешті — закриваємо сам WebSocket-зʼєднання
+		if err := c.WS.Close(); err != nil {
 			log.Println("[WebSocket] Ошибка при закрытии WebSocket:", err)
+			if closeErr == nil {
+				closeErr = err
+			}
 		} else {
 			log.Println("[WebSocket] Клиент успешно отключен")
 		}
-
-		// Закриваємо канал
-		close(c.sendChan)
 	})
-	return err
+
+	return closeErr
 }
 
 // ----------------------------------------------------------------------------
@@ -241,24 +293,6 @@ func (c *codec) FillArgs(arglist []reflect.Value) error {
 		}
 	}
 	return nil
-}
-
-// ----------------------------------------------------------------------------
-// sendLoop: відправляємо з каналу зашифрований payload
-// ----------------------------------------------------------------------------
-func (c *codec) sendLoop() {
-	for encryptedPayload := range c.sendChan {
-		c.mu.Lock()
-		err := c.WS.WriteMessage(websocket.BinaryMessage, encryptedPayload)
-		c.mu.Unlock()
-
-		if err != nil {
-			log.Println("[WebSocket] Ошибка при отправке сообщения:", err)
-			// Якщо відправка зламалась, є сенс припинити або дати break
-			break
-		}
-		c.wg.Done()
-	}
 }
 
 // ----------------------------------------------------------------------------
