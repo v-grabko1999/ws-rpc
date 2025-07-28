@@ -82,16 +82,12 @@ func TestBidirectionalRPC(t *testing.T) {
 
 	// Подключаем клиента
 	wsURL := "ws" + s.URL[4:]
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("Dial failed: %v", err)
-	}
 
 	// Настраиваем клиентский endpoint
 	clientRegistry := wsrpc.NewRegistry()
 	clientSvc := &ClientService{Done: done}
 	clientRegistry.RegisterService(clientSvc)
-	clientEP, err := wetsock.NewEndpoint(clientRegistry, conn, testKey)
+	clientEP, err := wetsock.NewAutoEndpoint(clientRegistry, wsURL, http.Header{}, testKey)
 	if err != nil {
 		t.Fatalf("NewEndpoint (client) failed: %v", err)
 	}
