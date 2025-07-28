@@ -1,12 +1,12 @@
 package wsrpc_test
 
 import (
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -16,129 +16,117 @@ import (
 
 const testKey = "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq" // 32 'q'
 
-// Глобальные переменные
-var stopServer sync.Once
-var stopChan chan struct{}
-var client *wsrpc.Endpoint
-
-// ServerService - сервис, который вызывается клиентом
+// ServerService — сервис, который вызывает метод на клиенте
 type ServerService struct{}
 
-func (s *ServerService) CallClient(_ *struct{}, _ *struct{}, endpoint *wsrpc.Endpoint) error {
-	log.Println("[Server] Клиент вызвал функцию на сервере")
+func (s *ServerService) CallClient(_ *struct{}, _ *struct{}, ep *wsrpc.Endpoint) error {
+	log.Println("[Server] Клиент вызвал сервер, вызываем ClientFunc на клиенте")
 	var reply struct{}
+	return ep.Call("ClientService.ClientFunc", &struct{}{}, &reply)
+}
 
-	err := endpoint.Call("ClientService.ClientFunc", &struct{}{}, &reply)
-	if err != nil {
-		log.Println("[Server] Ошибка вызова функции на клиенте:", err)
-		return err
-	}
+// ClientService — сервис, который вызывается сервером
+type ClientService struct {
+	Done chan struct{}
+}
 
-	log.Println("[Server] Вызов функции на клиенте успешен")
+func (c *ClientService) ClientFunc(_ *struct{}, _ *struct{}) error {
+	log.Println("[Client] Сервер вызвал ClientFunc, сигнализируем Done")
+	close(c.Done)
 	return nil
 }
 
-// ClientService - сервис, который вызывается сервером
-type ClientService struct{}
-
-func (c *ClientService) ClientFunc(_ *struct{}, _ *struct{}) error {
-	log.Println("[Client] Сервер вызвал функцию на клиенте, начинаем закрытие...")
-
-	// Даём серверу время обработать всё
-	time.Sleep(100 * time.Millisecond)
-
-	// Закрываем клиента перед сервером
-	stopServer.Do(func() {
-		log.Println("[Client] Закрываем клиентское соединение")
-		_ = client.Close()
-
-		log.Println("[Client] Клиент успешно завершил работу, отправляем сигнал серверу")
-		stopChan <- struct{}{}
-	})
-
-	return nil
+func isCloseErr(err error) bool {
+	if err == io.EOF {
+		return true
+	}
+	return websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway)
 }
 
 func TestBidirectionalRPC(t *testing.T) {
-	log.Println("[Test] Запуск теста двустороннего RPC")
-
-	stopChan = make(chan struct{})
 	var wg sync.WaitGroup
+	done := make(chan struct{})
 
-	// Запуск сервера
+	// Канал, через который HandlerFunc отдасть нам свой endpoint
+	serverEPCh := make(chan *wsrpc.Endpoint, 1)
+
+	// Поднимаем тестовый HTTP+WebSocket сервер
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upgrader := websocket.Upgrader{}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			t.Fatalf("Ошибка обновления WebSocket: %v", err)
+			t.Fatalf("Upgrade failed: %v", err)
 		}
-		log.Println("[Server] WebSocket подключение установлено")
 
-		// Реестр сервисов
+		// Создаем серверный endpoint и шлём его в main-гору
 		registry := wsrpc.NewRegistry()
 		registry.RegisterService(&ServerService{})
-
-		// Создаём RPC endpoint
-		endpoint, err := wetsock.NewEndpoint(registry, conn, testKey)
+		ep, err := wetsock.NewEndpoint(registry, conn, testKey)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("NewEndpoint failed: %v", err)
 		}
+		serverEPCh <- ep
 
+		// Запускаем Serve() для сервера
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			log.Println("[Server] Ожидание сообщений...")
-			if err := endpoint.Serve(); err != nil && err.Error() != "use of closed network connection" {
-				log.Printf("[Server] Ошибка обработки запросов: %v", err)
+			log.Println("[Server] Начинаем Serve()")
+			if err := ep.Serve(); err != nil && !isCloseErr(err) {
+				t.Errorf("server Serve error: %v", err)
 			}
-			log.Println("[Server] Сервер завершил работу")
+			log.Println("[Server] Serve() завершился")
 		}()
-
-		// Ждём закрытия сервера
-		<-stopChan
-		log.Println("[Server] Закрываем соединение")
-		_ = endpoint.Close()
 	}))
 	defer s.Close()
 
-	// Подключаем клиента к серверу
+	// Подключаем клиента
 	wsURL := "ws" + s.URL[4:]
-	log.Println("[Client] Подключение к серверу по WebSocket:", wsURL)
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
-		t.Fatalf("Ошибка подключения: %v", err)
+		t.Fatalf("Dial failed: %v", err)
 	}
 
-	// Регистрируем клиентский сервис
+	// Настраиваем клиентский endpoint
 	clientRegistry := wsrpc.NewRegistry()
-	clientRegistry.RegisterService(&ClientService{})
-
-	client, err = wetsock.NewEndpoint(clientRegistry, conn, testKey)
+	clientSvc := &ClientService{Done: done}
+	clientRegistry.RegisterService(clientSvc)
+	clientEP, err := wetsock.NewEndpoint(clientRegistry, conn, testKey)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("NewEndpoint (client) failed: %v", err)
 	}
+
+	// Запускаем Serve() для клиента
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		log.Println("[Client] Клиент слушает запросы...")
-		if err := client.Serve(); err != nil && err.Error() != "use of closed network connection" {
-			log.Printf("[Client] Ошибка обработки запросов: %v", err)
+		log.Println("[Client] Начинаем Serve()")
+		if err := clientEP.Serve(); err != nil && !isCloseErr(err) {
+			t.Errorf("client Serve error: %v", err)
 		}
-		log.Println("[Client] Клиент завершил работу")
+		log.Println("[Client] Serve() завершился")
 	}()
 
-	// Даём серверу и клиенту установиться
-	time.Sleep(500 * time.Millisecond)
+	// Получаем серверный endpoint из handler’а
+	serverEP := <-serverEPCh
 
-	// Клиент вызывает серверную функцию
+	// Делаем первый вызов: клиент → сервер → клиент
 	var reply struct{}
-	err = client.Call("ServerService.CallClient", &struct{}{}, &reply)
-	if err != nil {
-		t.Fatalf("[Client] Ошибка вызова ServerService.CallClient: %v", err)
+	if err := clientEP.Call("ServerService.CallClient", &struct{}{}, &reply); err != nil {
+		t.Fatalf("client.Call error: %v", err)
 	}
 
-	// Ждём завершения всех горутин
-	wg.Wait()
+	// Ждём, пока ClientService.ClientFunc закроет done
+	<-done
 
-	log.Println("[Test] Тест завершён успешно")
+	// Теперь мы завершаем оба endpoint’а в явном порядке
+	if err := clientEP.Close(); err != nil {
+		t.Errorf("client Close error: %v", err)
+	}
+	if err := serverEP.Close(); err != nil {
+		t.Errorf("server Close error: %v", err)
+	}
+
+	// Ждём, пока оба Serve() закончатся
+	wg.Wait()
 }
