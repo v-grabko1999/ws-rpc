@@ -34,7 +34,7 @@ type jsonMessage struct {
 
 type codec struct {
 	WS        *websocket.Conn
-	sendChan  chan *[]byte // Зверніть увагу: зберігаємо зашифровані дані ([]byte)
+	sendChan  chan []byte // Зверніть увагу: зберігаємо зашифровані дані ([]byte)
 	mu        sync.Mutex
 	closeOnce sync.Once
 	wg        sync.WaitGroup
@@ -71,12 +71,6 @@ func (c *codec) ReadMessage(msg *wsrpc.Message) error {
 		log.Println("[WebSocket] Ошибка дешифрования:", err)
 		return err
 	}
-
-	// Гарантируем возврат в пул в любой ветке
-	defer func() {
-		*decryptedBufPtr = (*decryptedBufPtr)[:0]
-		decryptPool.Put(decryptedBufPtr)
-	}()
 
 	// Розбираємо JSON
 	var jm jsonMessage
@@ -141,10 +135,9 @@ func (c *codec) sendLoop() {
 		}
 
 		c.mu.Lock()
-		err := c.WS.WriteMessage(websocket.BinaryMessage, *payload)
+		err := c.WS.WriteMessage(websocket.BinaryMessage, payload)
 		c.mu.Unlock()
 
-		bufPool.Put(payload)
 		// Завжди відмічаємо завершення відправки (успішної чи ні)
 		c.wg.Done()
 
@@ -260,7 +253,7 @@ func NewCodec(ws *websocket.Conn, keyString string) (*codec, error) {
 
 	c := &codec{
 		WS:       ws,
-		sendChan: make(chan *[]byte, 100),
+		sendChan: make(chan []byte, 100),
 		block:    block,
 		gcm:      gcm,
 	}
