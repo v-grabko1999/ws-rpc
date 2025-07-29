@@ -3,17 +3,14 @@ package wetsock
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
-	"io"
 	"log"
 	"reflect"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/klauspost/compress/zstd"
 
 	wsrpc "github.com/v-grabko1999/ws-rpc"
 )
@@ -37,7 +34,7 @@ type jsonMessage struct {
 
 type codec struct {
 	WS        *websocket.Conn
-	sendChan  chan []byte // Зверніть увагу: зберігаємо зашифровані дані ([]byte)
+	sendChan  chan *[]byte // Зверніть увагу: зберігаємо зашифровані дані ([]byte)
 	mu        sync.Mutex
 	closeOnce sync.Once
 	wg        sync.WaitGroup
@@ -46,65 +43,6 @@ type codec struct {
 	// Поля для AES-GCM
 	block cipher.Block
 	gcm   cipher.AEAD
-}
-
-// ----------------------------------------------------------------------------
-// Допоміжні функції для шифрування
-// ----------------------------------------------------------------------------
-
-func newAESGCM(key []byte) (cipher.Block, cipher.AEAD, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, nil, err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, nil, err
-	}
-	return block, gcm, nil
-}
-
-// encryptMessage шифрує (AES-GCM) plain []byte → encrypted []byte (nonce + ciphertext + auth tag)
-func (c *codec) encryptMessage(plaintext []byte) ([]byte, error) {
-	// стискаємо дані
-	enc := zstdEncoderPool.Get().(*zstd.Encoder)
-	defer zstdEncoderPool.Put(enc)
-
-	compressed := enc.EncodeAll(plaintext, nil)
-
-	nonce := make([]byte, c.gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, err
-	}
-
-	ciphertext := c.gcm.Seal(nonce, nonce, compressed, nil)
-	return ciphertext, nil
-}
-
-// decryptMessage розшифровує []byte (nonce + ciphertext + tag) → plain []byte
-func (c *codec) decryptMessage(ciphertext []byte) ([]byte, error) {
-	nonceSize := c.gcm.NonceSize()
-	if len(ciphertext) < nonceSize {
-		return nil, errors.New("ciphertext is too short")
-	}
-	nonce := ciphertext[:nonceSize]
-	data := ciphertext[nonceSize:]
-
-	compressed, err := c.gcm.Open(nil, nonce, data, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	dec := zstdDecoderPool.Get().(*zstd.Decoder)
-	defer zstdDecoderPool.Put(dec)
-
-	// розпакування
-	plaintext, err := dec.DecodeAll(compressed, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return plaintext, nil
 }
 
 // ----------------------------------------------------------------------------
@@ -128,15 +66,21 @@ func (c *codec) ReadMessage(msg *wsrpc.Message) error {
 	}
 
 	// Дешифруємо
-	decrypted, err := c.decryptMessage(data)
+	decryptedBufPtr, err := c.decryptMessage(data)
 	if err != nil {
 		log.Println("[WebSocket] Ошибка дешифрования:", err)
 		return err
 	}
 
+	// Гарантируем возврат в пул в любой ветке
+	defer func() {
+		*decryptedBufPtr = (*decryptedBufPtr)[:0]
+		decryptPool.Put(decryptedBufPtr)
+	}()
+
 	// Розбираємо JSON
 	var jm jsonMessage
-	if err := json.Unmarshal(decrypted, &jm); err != nil {
+	if err := json.Unmarshal(*decryptedBufPtr, &jm); err != nil {
 		log.Println("[WebSocket] Ошибка парсинга JSON:", err)
 		return err
 	}
@@ -182,6 +126,7 @@ func (c *codec) WriteMessage(msg *wsrpc.Message) error {
 		log.Println("[WebSocket] Таймаут отправки сообщения!")
 		return errors.New("таймаут отправки сообщения")
 	}
+
 }
 
 // ----------------------------------------------------------------------------
@@ -196,9 +141,10 @@ func (c *codec) sendLoop() {
 		}
 
 		c.mu.Lock()
-		err := c.WS.WriteMessage(websocket.BinaryMessage, payload)
+		err := c.WS.WriteMessage(websocket.BinaryMessage, *payload)
 		c.mu.Unlock()
 
+		bufPool.Put(payload)
 		// Завжди відмічаємо завершення відправки (успішної чи ні)
 		c.wg.Done()
 
@@ -314,7 +260,7 @@ func NewCodec(ws *websocket.Conn, keyString string) (*codec, error) {
 
 	c := &codec{
 		WS:       ws,
-		sendChan: make(chan []byte, 100),
+		sendChan: make(chan *[]byte, 100),
 		block:    block,
 		gcm:      gcm,
 	}
@@ -322,6 +268,18 @@ func NewCodec(ws *websocket.Conn, keyString string) (*codec, error) {
 	go c.sendLoop()
 
 	return c, nil
+}
+
+func newAESGCM(key []byte) (cipher.Block, cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, nil, err
+	}
+	return block, gcm, nil
 }
 
 // NewEndpoint створює Endpoint для WebSocket з увімкненим шифруванням
