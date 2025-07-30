@@ -156,7 +156,7 @@ func (c *codec) sendLoop() {
 
 func (c *codec) startHeartbeat() {
 	const (
-		pingPeriod = 30 * time.Second
+		pingPeriod = 2 * time.Second
 		pongWait   = 60 * time.Second
 		writeWait  = 10 * time.Second
 	)
