@@ -125,4 +125,5 @@ func TestBidirectionalRPC(t *testing.T) {
 
 	// Ждём, пока оба Serve() закончатся
 	wg.Wait()
+
 }
