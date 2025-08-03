@@ -167,7 +167,6 @@ func (c *codec) startHeartbeat() {
 	// Встановлюємо ReadDeadline і обробник PONG
 	c.WS.SetReadDeadline(time.Now().Add(pongWait))
 	c.WS.SetPongHandler(func(appData string) error {
-		log.Println("[WebSocket] Pong отримано, зберігаємо deadline")
 		return c.WS.SetReadDeadline(time.Now().Add(pongWait))
 	})
 
@@ -182,7 +181,6 @@ func (c *codec) startHeartbeat() {
 				c.mu.Unlock()
 				return
 			}
-			log.Println("[WebSocket] Відправлено PING")
 			c.mu.Unlock()
 		case <-c.heartbeatDone:
 			return
