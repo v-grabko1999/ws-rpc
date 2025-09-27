@@ -84,15 +84,6 @@ func TestIntegration_ServerAndClient_PublicAPI(t *testing.T) {
 			default:
 			}
 
-			// Запускаємо Serve() в горутині
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if err := ep.Serve(); err != nil && !isCloseErr(err) {
-					t.Logf("[Server] Serve error: %v", err)
-				}
-			}()
-
 			// Також запустимо фонову спробу викликати клієнтський метод —
 			// робимо це з невеликими повторними спробами (щоб уникнути race)
 			wg.Add(1)
