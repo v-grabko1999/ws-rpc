@@ -127,3 +127,159 @@ func TestBidirectionalRPC(t *testing.T) {
 	wg.Wait()
 
 }
+
+/*
+// Генерує пару X25519 (приватний 32 байти, публічний 32 байти)
+func genX25519KeyPair() (priv, pub [32]byte, err error) {
+	_, err = io.ReadFull(rand.Reader, priv[:])
+	if err != nil {
+		return
+	}
+	// Приводимо приватний ключ до формату X25519 (clamping)
+	priv[0] &= 248
+	priv[31] &= 127
+	priv[31] |= 64
+
+	curve25519.ScalarBaseMult(&pub, &priv)
+	return
+}
+
+// DH: X25519(shared) = scalarMult(priv, peerPub)
+func dh(priv [32]byte, peerPub [32]byte) ([32]byte, error) {
+	var out [32]byte
+	curve25519.ScalarMult(&out, &priv, &peerPub)
+	return out, nil
+}
+
+// З'єднати кілька DH-виходів у один секрет через HKDF-SHA256
+func deriveSessionKey(dhParts [][]byte, info []byte) ([]byte, error) {
+	// Об'єднаємо DH частини в буфер
+	concat := []byte{}
+	for _, p := range dhParts {
+		concat = append(concat, p...)
+	}
+	// Використаємо HKDF(SHA256, ikm=concat) для отримання 32 байт ключа
+	hk := hkdf.New(sha256.New, concat, nil, info)
+	key := make([]byte, 32)
+	_, err := io.ReadFull(hk, key)
+	if err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+// Шифрування AES-256-GCM
+func encryptAESGCM(key, plaintext []byte) (nonce, ciphertext []byte, err error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, nil, err
+	}
+	nonce = make([]byte, gcm.NonceSize())
+	_, err = io.ReadFull(rand.Reader, nonce)
+	if err != nil {
+		return nil, nil, err
+	}
+	ciphertext = gcm.Seal(nil, nonce, plaintext, nil)
+	return nonce, ciphertext, nil
+}
+
+// Дешифрування AES-256-GCM
+func decryptAESGCM(key, nonce, ciphertext []byte) (plaintext []byte, err error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err = gcm.Open(nil, nonce, ciphertext, nil)
+	return plaintext, err
+}
+
+func TestBidirectionalMMM(t *testing.T) {
+	// --- СТАТИЧНИЙ КЛЮЧ СЕРВЕРА (згенеровано один раз і зберігається) ---
+	serverStaticPriv, serverStaticPub, err := genX25519KeyPair()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("Server static pub:", hex.EncodeToString(serverStaticPub[:]))
+
+	// --- СИМУЛЯЦІЯ КЛІЄНТА ---
+	// Клієнт генерує епхемерний ключ
+	clientEphPriv, clientEphPub, err := genX25519KeyPair()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("Client eph pub:", hex.EncodeToString(clientEphPub[:]))
+
+	// Клієнт відправляє свій clientEphPub серверу.
+	// Сервер: для цієї сесії генерує ephemeral ключ
+	serverEphPriv, serverEphPub, err := genX25519KeyPair()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("Server eph pub:", hex.EncodeToString(serverEphPub[:]))
+
+	// Тепер кожна сторона обчислює два DH:
+	// A) clientEphPriv <-> serverStaticPub
+	// B) clientEphPriv <-> serverEphPub
+	// (сервер симетрично обчислює серверEphPriv <-> clientEphPub і serverStaticPriv <-> clientEphPub)
+
+	// --- КЛІЄНТ --- обчислення DH
+	dh1_client, err := dh(clientEphPriv, serverStaticPub) // clientEph x serverStatic
+	if err != nil {
+		panic(err)
+	}
+	dh2_client, err := dh(clientEphPriv, serverEphPub) // clientEph x serverEph
+	if err != nil {
+		panic(err)
+	}
+
+	// --- СЕРВЕР --- обчислення DH
+	dh1_server, err := dh(serverStaticPriv, clientEphPub) // serverStatic x clientEph
+	if err != nil {
+		panic(err)
+	}
+	dh2_server, err := dh(serverEphPriv, clientEphPub) // serverEph x clientEph
+	if err != nil {
+		panic(err)
+	}
+
+	// Для надійності перевіримо, що клієнт і сервер отримали ті самі значення
+	if !hmac.Equal(dh1_client[:], dh1_server[:]) || !hmac.Equal(dh2_client[:], dh2_server[:]) {
+		panic("DH mismatch")
+	}
+
+	// Derive final session key (обидві сторони виконують те саме)
+	info := []byte("X25519-Signal-simple-v1")
+	sessionKeyClient, err := deriveSessionKey([][]byte{dh1_client[:], dh2_client[:]}, info)
+	if err != nil {
+		panic(err)
+	}
+	sessionKeyServer, err := deriveSessionKey([][]byte{dh1_server[:], dh2_server[:]}, info)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("Session key (client):", hex.EncodeToString(sessionKeyClient))
+	fmt.Println("Session key (server):", hex.EncodeToString(sessionKeyServer))
+
+	// Симетричне шифрування перевірка
+	msg := []byte("Secret message: привіт, перевірка сесії")
+	nonce, ct, err := encryptAESGCM(sessionKeyClient, msg)
+	if err != nil {
+		panic(err)
+	}
+	pt, err := decryptAESGCM(sessionKeyServer, nonce, ct)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("Decrypted:", string(pt))
+	t.Fatal(1)
+}
+*/
