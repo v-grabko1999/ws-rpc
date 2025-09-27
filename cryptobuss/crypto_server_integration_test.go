@@ -4,15 +4,12 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
-	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/gorilla/websocket"
 
 	wsrpc "github.com/v-grabko1999/ws-rpc"
 	"github.com/v-grabko1999/ws-rpc/cryptobuss"
@@ -39,13 +36,6 @@ func (c *ClientService) ClientFunc(_ *struct{}, _ *struct{}) error {
 	log.Println("[Client] Сервер вызвал ClientFunc, сигнализируем Done")
 	close(c.Done)
 	return nil
-}
-
-func isCloseErr(err error) bool {
-	if err == io.EOF {
-		return true
-	}
-	return websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway)
 }
 
 // --- власне тест ---
