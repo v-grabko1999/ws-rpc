@@ -3,9 +3,12 @@ package wetsock
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	crand "crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"log"
+	mrand "math/rand"
 	"reflect"
 	"sync"
 	"time"
@@ -90,6 +93,11 @@ func (c *codec) ReadMessage(msg *wsrpc.Message) error {
 	return nil
 }
 
+type paddedMessage struct {
+	*wsrpc.Message
+	Pad string `json:"pad,omitempty"`
+}
+
 // WriteMessage: серіалізуємо msg у JSON, шифруємо й відправляємо в канал
 func (c *codec) WriteMessage(msg *wsrpc.Message) error {
 	c.mu.Lock()
@@ -100,8 +108,18 @@ func (c *codec) WriteMessage(msg *wsrpc.Message) error {
 		return errors.New("соединение закрывается, отправка невозможна")
 	}
 
+	// сформувати паддінг довжиною 0..N байт
+	padLen := mrand.Intn(MaxPad + 1)
+	pad := make([]byte, padLen)
+	if _, err := crand.Read(pad); err != nil {
+		return err
+	}
+
 	// 1) Спочатку серіалізуємо у JSON
-	rawJSON, err := json.Marshal(msg)
+	rawJSON, err := json.Marshal(paddedMessage{
+		Message: msg,
+		Pad:     base64.StdEncoding.EncodeToString(pad),
+	})
 	if err != nil {
 		return err
 	}
@@ -117,7 +135,7 @@ func (c *codec) WriteMessage(msg *wsrpc.Message) error {
 	select {
 	case c.sendChan <- encrypted:
 		return nil
-	case <-time.After(2 * time.Second):
+	case <-time.After(TimeOutWrite * time.Second):
 		c.wg.Done()
 		log.Println("[WebSocket] Таймаут отправки сообщения!")
 		return errors.New("таймаут отправки сообщения")
@@ -155,11 +173,6 @@ func (c *codec) sendLoop() {
 }
 
 func (c *codec) startHeartbeat() {
-	const (
-		pingPeriod = 2 * time.Second
-		pongWait   = 60 * time.Second
-		writeWait  = 10 * time.Second
-	)
 
 	ticker := time.NewTicker(pingPeriod)
 	defer ticker.Stop()
@@ -283,7 +296,7 @@ func (c *codec) FillArgs(arglist []reflect.Value) error {
 func NewCodec(ws *websocket.Conn, keyString string) (*codec, error) {
 	// Перевірка довжини ключа
 	key := []byte(keyString)
-	if len(key) != 32 {
+	if len(key) != LenSecretKey {
 		return nil, errors.New("ключ повинен мати 32 байти довжини (AES-256)")
 	}
 
@@ -294,7 +307,7 @@ func NewCodec(ws *websocket.Conn, keyString string) (*codec, error) {
 
 	c := &codec{
 		WS:            ws,
-		sendChan:      make(chan []byte, 1*1024*1024),
+		sendChan:      make(chan []byte, SendChanLen),
 		heartbeatDone: make(chan struct{}),
 		block:         block,
 		gcm:           gcm,
