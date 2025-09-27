@@ -73,59 +73,56 @@ func TestIntegration_ServerAndClient_PublicAPI(t *testing.T) {
 	serverCfg := &cryptobuss.ServerCfg{
 		SignPriv: priv,
 		KeyID:    "test-key-1",
+		OnRegistry: func(reg *wsrpc.Registry) error {
+			reg.RegisterService(&ServerService{})
+			return nil
+		},
+		OnEndpoint: func(ep *wsrpc.Endpoint) error {
+			// віддаємо endpoint назовні, щоб тест міг його закрити вкінці
+			select {
+			case serverEPCh <- ep:
+			default:
+			}
+
+			// Запускаємо Serve() в горутині
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := ep.Serve(); err != nil && !isCloseErr(err) {
+					t.Logf("[Server] Serve error: %v", err)
+				}
+			}()
+
+			// Також запустимо фонову спробу викликати клієнтський метод —
+			// робимо це з невеликими повторними спробами (щоб уникнути race)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				// чекаємо трохи для стабільності з'єднання
+				deadline := time.Now().Add(5 * time.Second)
+				for time.Now().Before(deadline) {
+					// Викликаємо ClientService.ClientFunc (якщо клієнт вже зареєстрував свій сервіс — викличеться)
+					var reply struct{}
+					err := ep.Call("ClientService.ClientFunc", &struct{}{}, &reply)
+					if err == nil {
+						// успіх — більше не намагаємось
+						return
+					}
+					// не вдалось — зачекаємо і спробуємо ще
+					time.Sleep(50 * time.Millisecond)
+				}
+				// якщо не вдалось — логнемо
+				t.Logf("[Server] warning: could not call client method within timeout")
+			}()
+
+			return nil
+		},
 	}
 
 	// 3) піднімаємо httptest сервер
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Викликаємо ваш public Server API всередині handler'а
-		err := cryptobuss.Server(serverCfg, w, r,
-			// fn: реєструємо серверний сервіс
-			func(reg *wsrpc.Registry) error {
-				reg.RegisterService(&ServerService{})
-				return nil
-			},
-			// fnEnd: коли endpoint створено — передаємо його в канал і запускаємо Serve()
-			func(ep *wsrpc.Endpoint) error {
-				// віддаємо endpoint назовні, щоб тест міг його закрити вкінці
-				select {
-				case serverEPCh <- ep:
-				default:
-				}
-
-				// Запускаємо Serve() в горутині
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					if err := ep.Serve(); err != nil && !isCloseErr(err) {
-						t.Logf("[Server] Serve error: %v", err)
-					}
-				}()
-
-				// Також запустимо фонову спробу викликати клієнтський метод —
-				// робимо це з невеликими повторними спробами (щоб уникнути race)
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					// чекаємо трохи для стабільності з'єднання
-					deadline := time.Now().Add(5 * time.Second)
-					for time.Now().Before(deadline) {
-						// Викликаємо ClientService.ClientFunc (якщо клієнт вже зареєстрував свій сервіс — викличеться)
-						var reply struct{}
-						err := ep.Call("ClientService.ClientFunc", &struct{}{}, &reply)
-						if err == nil {
-							// успіх — більше не намагаємось
-							return
-						}
-						// не вдалось — зачекаємо і спробуємо ще
-						time.Sleep(50 * time.Millisecond)
-					}
-					// якщо не вдалось — логнемо
-					t.Logf("[Server] warning: could not call client method within timeout")
-				}()
-
-				return nil
-			},
-		)
+		err := cryptobuss.Server(serverCfg, w, r)
 		if err != nil {
 			// Якщо Server повернув помилку — лог і завершення тесту
 			t.Fatalf("cryptobuss.Server returned error: %v", err)
