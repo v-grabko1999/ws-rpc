@@ -3,12 +3,11 @@ package wetsock
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	crand "crypto/rand"
-	"encoding/base64"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"log"
-	mrand "math/rand"
+	"math/big"
 	"reflect"
 	"sync"
 	"time"
@@ -109,16 +108,16 @@ func (c *codec) WriteMessage(msg *wsrpc.Message) error {
 	}
 
 	// сформувати паддінг довжиною 0..N байт
-	padLen := mrand.Intn(MaxPad + 1)
-	pad := make([]byte, padLen)
-	if _, err := crand.Read(pad); err != nil {
+	// сформувати паддінг довжиною 0..MaxPad байт за допомогою crypto/rand
+	n, err := rand.Int(rand.Reader, big.NewInt(MaxPad+1))
+	if err != nil {
 		return err
 	}
 
 	// 1) Спочатку серіалізуємо у JSON
 	rawJSON, err := json.Marshal(paddedMessage{
 		Message: msg,
-		Pad:     base64.StdEncoding.EncodeToString(pad),
+		Pad:     randLetters(int(n.Int64())),
 	})
 	if err != nil {
 		return err

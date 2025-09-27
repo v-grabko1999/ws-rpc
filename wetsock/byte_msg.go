@@ -8,7 +8,6 @@ import (
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
-
 )
 
 var (

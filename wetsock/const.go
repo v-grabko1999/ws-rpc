@@ -1,6 +1,10 @@
 package wetsock
 
-import "time"
+import (
+	crand "crypto/rand"
+	"math/big"
+	"time"
+)
 
 const (
 	//WriteMessage
@@ -15,3 +19,14 @@ const (
 	pongWait   = 60 * time.Second
 	writeWait  = 10 * time.Second
 )
+
+func randLetters(n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	b := make([]byte, n)
+	for i := range b {
+		// беремо випадковий індекс у діапазоні [0, len(letters))
+		idx, _ := crand.Int(crand.Reader, big.NewInt(int64(len(letters))))
+		b[i] = letters[idx.Int64()]
+	}
+	return string(b)
+}
