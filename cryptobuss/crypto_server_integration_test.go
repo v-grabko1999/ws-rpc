@@ -134,7 +134,7 @@ func TestIntegration_ServerAndClient_PublicAPI(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err := cryptobuss.Client(clientCfg)
+		err := cryptobuss.Client("test-key-1", clientCfg)
 		// Client зазвичай завершується при cfg.Stop() — сюди повернеться nil або помилка
 		clientErrCh <- err
 	}()

@@ -89,7 +89,7 @@ func (cfg *ClientCfg) nextBackoff(attempt int) time.Duration {
 	return jitter
 }
 
-func Client(cfg *ClientCfg) error {
+func Client(keyID string, cfg *ClientCfg) error {
 	if cfg == nil || cfg.ServerSignPubBase64 == "" {
 		return errors.New("client config: ServerSignPubBase64 required")
 	}
@@ -197,7 +197,7 @@ func Client(cfg *ClientCfg) error {
 			}
 		}
 
-		sessionKey, err := performClientHandshake(conn, cfg.ServerSignPubBase64, "key-id")
+		sessionKey, err := performClientHandshake(conn, cfg.ServerSignPubBase64, keyID)
 		if err != nil || len(sessionKey) != 32 {
 			if err == nil {
 				err = fmt.Errorf("invalid session key length: %d", len(sessionKey))
