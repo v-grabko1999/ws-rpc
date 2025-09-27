@@ -18,6 +18,11 @@ const (
 	pingPeriod = 2 * time.Second
 	pongWait   = 60 * time.Second
 	writeWait  = 10 * time.Second
+
+	//autoEndpoint
+	pingInterval         = 30 * time.Second
+	reconnectMaxAttempts = 5
+	reconnectBackoffBase = 1 * time.Second
 )
 
 func randLetters(n int) string {

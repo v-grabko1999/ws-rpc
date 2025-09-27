@@ -11,12 +11,6 @@ import (
 	wsrpc "github.com/v-grabko1999/ws-rpc"
 )
 
-const (
-	pingInterval         = 30 * time.Second
-	reconnectMaxAttempts = 5
-	reconnectBackoffBase = 1 * time.Second
-)
-
 type AutoEndpoint struct {
 	registry *wsrpc.Registry
 	url      string
