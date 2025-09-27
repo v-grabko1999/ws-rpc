@@ -280,31 +280,6 @@ func (c *codec) FillArgs(arglist []reflect.Value) error {
 // Фабрика для створення зашифрованого codec
 // ----------------------------------------------------------------------------
 
-// NewCodec створює codec, приймаючи ключ як рядок
-func NewCodecOld(ws *websocket.Conn, keyString string) (*codec, error) {
-	// Припустимо, що нам потрібні рівно 32 байти (AES-256).
-	key := []byte(keyString)
-	if len(key) != 32 {
-		return nil, errors.New("ключ повинен мати 32 байти довжини (AES-256)")
-	}
-
-	block, gcm, err := newAESGCM(key)
-	if err != nil {
-		return nil, err
-	}
-
-	c := &codec{
-		WS:       ws,
-		sendChan: make(chan []byte, 100),
-		block:    block,
-		gcm:      gcm,
-	}
-	// Запускаємо горутину відправлення
-	go c.sendLoop()
-
-	return c, nil
-}
-
 func NewCodec(ws *websocket.Conn, keyString string) (*codec, error) {
 	// Перевірка довжини ключа
 	key := []byte(keyString)
@@ -319,7 +294,7 @@ func NewCodec(ws *websocket.Conn, keyString string) (*codec, error) {
 
 	c := &codec{
 		WS:            ws,
-		sendChan:      make(chan []byte, 100),
+		sendChan:      make(chan []byte, 1*1024*1024),
 		heartbeatDone: make(chan struct{}),
 		block:         block,
 		gcm:           gcm,
