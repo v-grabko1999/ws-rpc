@@ -110,7 +110,7 @@ func Client(keyID string, cfg *ClientCfg) error {
 	if strings.HasPrefix(cfg.RpcServerURL, "https://") {
 		wsScheme = "wss"
 	}
-	wsURL := fmt.Sprintf("%s://%s/rpc", wsScheme, strings.TrimPrefix(strings.TrimPrefix(cfg.RpcServerURL, "http://"), "https://"))
+	wsURL := fmt.Sprintf("%s://%s/rpc-cryptobuss", wsScheme, strings.TrimPrefix(strings.TrimPrefix(cfg.RpcServerURL, "http://"), "https://"))
 
 	attempt := 0
 	var deadline time.Time
