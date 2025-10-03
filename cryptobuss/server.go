@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 
 	"github.com/gorilla/websocket"
 	wsrpc "github.com/v-grabko1999/ws-rpc"
@@ -66,8 +67,11 @@ func Server(cfg *ServerCfg, w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
+	wg := sync.WaitGroup{}
 	// 4) СТАРТУЄМО Serve() ТУТ, щоб підключення стало активним негайно
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		if err := endpoint.Serve(); err != nil && !websocket.IsCloseError(err,
 			websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 			log.Printf("[Server] Serve error: %v\n", err)
@@ -83,6 +87,6 @@ func Server(cfg *ServerCfg, w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 
-	// 6) НІЧОГО більше не робимо: з’єднання живе, Serve() уже крутиться у горутині
+	wg.Wait()
 	return nil
 }
