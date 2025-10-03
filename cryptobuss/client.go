@@ -41,7 +41,7 @@ type ClientCfg struct {
 
 	// Колбеки (необов'язкові)
 	OnReconnectAttempt func(attempt int, sleep time.Duration, lastErr error)
-	OnConnected        func()                                          // коли з’єднання встановлено
+	OnConnected        func(endpoint *wsrpc.Endpoint)                  // коли з’єднання встановлено
 	OnDisconnected     func(err error)                                 // коли Serve() завершився
 	OnGiveUp           func(reason string, attempt int, lastErr error) // коли припиняємо спроби
 }
@@ -249,7 +249,7 @@ func Client(keyID string, cfg *ClientCfg) error {
 		}
 
 		if cfg.OnConnected != nil {
-			cfg.OnConnected()
+			cfg.OnConnected(endpoint)
 		}
 
 		// Блокуємось у Serve() до розриву
