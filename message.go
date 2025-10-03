@@ -32,17 +32,15 @@ type Message struct {
 	// Information on how the call failed. Only valid for a
 	// response. Must be present if Result is omitted.
 	Error *Error `json:"error,omitempty"`
+
+	Pad string `json:"pad,omitempty"`
 }
 
 // Error is the on-wire description of an error that occurred while
 // serving the method call.
 type Error struct {
-	Msg string `json:"msg,omitempty"`
-
-	// more fields may be added later
-
-	// TODO ponder about error detail, way for clients to tell
-	// transient/permanent, bad request vs out of memory
+	Code int    `json:"code,omitempty"`
+	Msg  string `json:"msg,omitempty"`
 }
 
 func (e Error) Error() string {

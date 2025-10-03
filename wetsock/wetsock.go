@@ -1,7 +1,6 @@
 package wetsock
 
 import (
-	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/json"
@@ -16,19 +15,6 @@ import (
 
 	wsrpc "github.com/v-grabko1999/ws-rpc"
 )
-
-// ----------------------------------------------------------------------------
-// Допоміжні структури
-// ----------------------------------------------------------------------------
-
-// jsonMessage використовується для первинної десеріалізації після дешифрування
-type jsonMessage struct {
-	ID     uint64          `json:"id,string,omitempty"`
-	Func   string          `json:"fn,omitempty"`
-	Args   json.RawMessage `json:"args,omitempty"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  *wsrpc.Error    `json:"error"`
-}
 
 // ----------------------------------------------------------------------------
 // Наш розширений codec
@@ -52,6 +38,14 @@ type codec struct {
 // ----------------------------------------------------------------------------
 // Методи, що вимагає wsrpc.Codec
 // ----------------------------------------------------------------------------
+
+type jsonMessage struct {
+	ID     uint64          `json:"id,string,omitempty"`
+	Func   string          `json:"fn,omitempty"`
+	Args   json.RawMessage `json:"args,omitempty"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *wsrpc.Error    `json:"error"`
+}
 
 // ReadMessage: читаємо бінарні дані, дешифруємо, потім розбираємо JSON
 func (c *codec) ReadMessage(msg *wsrpc.Message) error {
@@ -92,11 +86,6 @@ func (c *codec) ReadMessage(msg *wsrpc.Message) error {
 	return nil
 }
 
-type paddedMessage struct {
-	*wsrpc.Message
-	Pad string `json:"pad,omitempty"`
-}
-
 // WriteMessage: серіалізуємо msg у JSON, шифруємо й відправляємо в канал
 func (c *codec) WriteMessage(msg *wsrpc.Message) error {
 	c.mu.Lock()
@@ -114,11 +103,9 @@ func (c *codec) WriteMessage(msg *wsrpc.Message) error {
 		return err
 	}
 
+	msg.Pad = randLetters(int(n.Int64()))
 	// 1) Спочатку серіалізуємо у JSON
-	rawJSON, err := json.Marshal(paddedMessage{
-		Message: msg,
-		Pad:     randLetters(int(n.Int64())),
-	})
+	rawJSON, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
@@ -286,58 +273,4 @@ func (c *codec) FillArgs(arglist []reflect.Value) error {
 		}
 	}
 	return nil
-}
-
-// ----------------------------------------------------------------------------
-// Фабрика для створення зашифрованого codec
-// ----------------------------------------------------------------------------
-
-func NewCodec(ws *websocket.Conn, keyString string) (*codec, error) {
-	// Перевірка довжини ключа
-	key := []byte(keyString)
-	if len(key) != LenSecretKey {
-		return nil, errors.New("ключ повинен мати 32 байти довжини (AES-256)")
-	}
-
-	block, gcm, err := newAESGCM(key)
-	if err != nil {
-		return nil, err
-	}
-
-	c := &codec{
-		WS:            ws,
-		sendChan:      make(chan []byte, SendChanLen),
-		heartbeatDone: make(chan struct{}),
-		block:         block,
-		gcm:           gcm,
-	}
-
-	// Горутіна для відправки зашифрованих повідомлень
-	go c.sendLoop()
-	// Горутіна для PING/PONG
-	go c.startHeartbeat()
-
-	return c, nil
-}
-
-func newAESGCM(key []byte) (cipher.Block, cipher.AEAD, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, nil, err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, nil, err
-	}
-	return block, gcm, nil
-}
-
-// NewEndpoint створює Endpoint для WebSocket з увімкненим шифруванням
-func NewEndpoint(registry *wsrpc.Registry, ws *websocket.Conn, keyString string) (*wsrpc.Endpoint, error) {
-	c, err := NewCodec(ws, keyString)
-	if err != nil {
-		return nil, err
-	}
-	e := wsrpc.NewEndpoint(c, registry)
-	return e, nil
 }
