@@ -2,18 +2,11 @@ package wetsock
 
 import (
 	"crypto/cipher"
-	"crypto/rand"
-	"encoding/json"
-	"errors"
 	"log"
-	"math/big"
-	"reflect"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-
-	wsrpc "github.com/v-grabko1999/ws-rpc"
 )
 
 // ----------------------------------------------------------------------------
@@ -33,100 +26,6 @@ type codec struct {
 	// Поля для AES-GCM
 	block cipher.Block
 	gcm   cipher.AEAD
-}
-
-// ----------------------------------------------------------------------------
-// Методи, що вимагає wsrpc.Codec
-// ----------------------------------------------------------------------------
-
-type jsonMessage struct {
-	ID     uint64          `json:"id,string,omitempty"`
-	Func   string          `json:"fn,omitempty"`
-	Args   json.RawMessage `json:"args,omitempty"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  *wsrpc.Error    `json:"error"`
-}
-
-// ReadMessage: читаємо бінарні дані, дешифруємо, потім розбираємо JSON
-func (c *codec) ReadMessage(msg *wsrpc.Message) error {
-	mt, data, err := c.WS.ReadMessage()
-	if err != nil {
-		// Перевірка закриття
-		if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-			log.Println("[WebSocket] Соединение закрыто:", err)
-			return err
-		}
-		log.Println("[WebSocket] Ошибка чтения сообщения:", err)
-		return err
-	}
-	if mt != websocket.BinaryMessage {
-		return errors.New("ожидался бинарный шифрованный формат, а пришел другой тип")
-	}
-
-	// Дешифруємо
-	decryptedBufPtr, err := c.decryptMessage(data)
-	if err != nil {
-		log.Println("[WebSocket] Ошибка дешифрования:", err)
-		return err
-	}
-
-	// Розбираємо JSON
-	var jm jsonMessage
-	if err := json.Unmarshal(*decryptedBufPtr, &jm); err != nil {
-		log.Println("[WebSocket] Ошибка парсинга JSON:", err)
-		return err
-	}
-
-	// Заповнюємо wsrpc.Message
-	msg.ID = jm.ID
-	msg.Func = jm.Func
-	msg.Args = jm.Args
-	msg.Result = jm.Result
-	msg.Error = jm.Error
-	return nil
-}
-
-// WriteMessage: серіалізуємо msg у JSON, шифруємо й відправляємо в канал
-func (c *codec) WriteMessage(msg *wsrpc.Message) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closing {
-		log.Println("[WebSocket] Попытка отправки сообщения после закрытия соединения!")
-		return errors.New("соединение закрывается, отправка невозможна")
-	}
-
-	// сформувати паддінг довжиною 0..N байт
-	// сформувати паддінг довжиною 0..MaxPad байт за допомогою crypto/rand
-	n, err := rand.Int(rand.Reader, big.NewInt(MaxPad+1))
-	if err != nil {
-		return err
-	}
-
-	msg.Pad = randLetters(int(n.Int64()))
-	// 1) Спочатку серіалізуємо у JSON
-	rawJSON, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-
-	// 2) Шифруємо
-	encrypted, err := c.encryptMessage(rawJSON)
-	if err != nil {
-		return err
-	}
-
-	// 3) Кладемо зашифровані дані у sendChan
-	c.wg.Add(1)
-	select {
-	case c.sendChan <- encrypted:
-		return nil
-	case <-time.After(TimeOutWrite * time.Second):
-		c.wg.Done()
-		log.Println("[WebSocket] Таймаут отправки сообщения!")
-		return errors.New("таймаут отправки сообщения")
-	}
-
 }
 
 // ----------------------------------------------------------------------------
@@ -233,44 +132,4 @@ func (c *codec) Close() error {
 	})
 
 	return closeErr
-}
-
-// ----------------------------------------------------------------------------
-// Додаткові методи (потрібні інтерфейсу wsrpc.Codec)
-// ----------------------------------------------------------------------------
-
-// UnmarshalArgs десеріалізує msg.Args -> ваші аргументи
-func (c *codec) UnmarshalArgs(msg *wsrpc.Message, args interface{}) error {
-	raw, ok := msg.Args.(json.RawMessage)
-	if !ok || raw == nil {
-		return nil
-	}
-	err := json.Unmarshal(raw, args)
-	if err != nil {
-		log.Println("[WebSocket] Ошибка десериализации аргументов:", err)
-	}
-	return err
-}
-
-// UnmarshalResult десеріалізує msg.Result -> змінна result
-func (c *codec) UnmarshalResult(msg *wsrpc.Message, result interface{}) error {
-	raw, ok := msg.Result.(json.RawMessage)
-	if !ok || raw == nil {
-		return errors.New("wsrpc.jsonmsg response must set result")
-	}
-	err := json.Unmarshal(raw, result)
-	if err != nil {
-		log.Println("[WebSocket] Ошибка десериализации результата:", err)
-	}
-	return err
-}
-
-// FillArgs якщо в RPC-методах передбачено *websocket.Conn, замінює аргумент
-func (c *codec) FillArgs(arglist []reflect.Value) error {
-	for i := 0; i < len(arglist); i++ {
-		if _, ok := arglist[i].Interface().(*websocket.Conn); ok {
-			arglist[i] = reflect.ValueOf(c.WS)
-		}
-	}
-	return nil
 }
