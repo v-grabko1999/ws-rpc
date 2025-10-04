@@ -9,4 +9,7 @@ require (
 	golang.org/x/crypto v0.42.0
 )
 
-require github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
+require (
+	github.com/google/uuid v1.6.0
+	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
+)

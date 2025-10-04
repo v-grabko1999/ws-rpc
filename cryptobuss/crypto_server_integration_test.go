@@ -67,7 +67,7 @@ func TestIntegration_ServerAndClient_PublicAPI(t *testing.T) {
 			reg.RegisterService(&ServerService{})
 			return nil
 		},
-		OnEndpoint: func(ep *wsrpc.Endpoint) error {
+		OnEndpoint: func(r *http.Request, id string, ep *wsrpc.Endpoint) error {
 			// віддаємо endpoint назовні, щоб тест міг його закрити вкінці
 			select {
 			case serverEPCh <- ep:

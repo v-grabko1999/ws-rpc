@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	wsrpc "github.com/v-grabko1999/ws-rpc"
 	"github.com/v-grabko1999/ws-rpc/wetsock"
@@ -19,7 +20,11 @@ type ServerCfg struct {
 	KeyID    string
 
 	OnRegistry func(reg *wsrpc.Registry) error
-	OnEndpoint func(*wsrpc.Endpoint) error
+
+	OnEndpoint func(*http.Request, string, *wsrpc.Endpoint) error
+
+	conn   map[string]*wsrpc.Endpoint
+	connMu sync.RWMutex
 }
 
 // Server виконує websocket-апгрейд, крипто-handshake, створює Endpoint і САМ запускає Serve().
@@ -28,6 +33,12 @@ type ServerCfg struct {
 func Server(cfg *ServerCfg, w http.ResponseWriter, r *http.Request) error {
 	if cfg == nil || cfg.SignPriv == nil || len(cfg.SignPriv) == 0 || cfg.KeyID == "" {
 		return errors.New("server config incomplete: SignPriv and KeyID required")
+	}
+
+	if cfg.conn == nil {
+		cfg.connMu.Lock()
+		cfg.conn = map[string]*wsrpc.Endpoint{}
+		cfg.connMu.Unlock()
 	}
 
 	upgrader := websocket.Upgrader{
@@ -66,12 +77,17 @@ func Server(cfg *ServerCfg, w http.ResponseWriter, r *http.Request) error {
 		_ = conn.Close()
 		return err
 	}
+	id := uuid.NewString()
 
 	wg := sync.WaitGroup{}
 	// 4) СТАРТУЄМО Serve() ТУТ, щоб підключення стало активним негайно
 	wg.Add(1)
 	go func() {
-		defer wg.Done()
+		defer func() {
+			cfg.connMu.Lock()
+			delete(cfg.conn, id)
+			cfg.connMu.Unlock()
+		}()
 		if err := endpoint.Serve(); err != nil && !websocket.IsCloseError(err,
 			websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 			log.Printf("[Server] Serve error: %v\n", err)
@@ -80,7 +96,7 @@ func Server(cfg *ServerCfg, w http.ResponseWriter, r *http.Request) error {
 
 	// 5) Додаткові дії користувача над endpoint (без Serve())
 	if cfg.OnEndpoint != nil {
-		if err := cfg.OnEndpoint(endpoint); err != nil {
+		if err := cfg.OnEndpoint(r, id, endpoint); err != nil {
 			// Якщо хук повернув помилку — коректно закриваємо endpoint
 			_ = endpoint.Close()
 			return err
@@ -89,4 +105,76 @@ func Server(cfg *ServerCfg, w http.ResponseWriter, r *http.Request) error {
 
 	wg.Wait()
 	return nil
+}
+
+func (cfg *ServerCfg) snapshot() map[string]*wsrpc.Endpoint {
+	cfg.connMu.RLock()
+	defer cfg.connMu.RUnlock()
+	cp := make(map[string]*wsrpc.Endpoint, len(cfg.conn))
+	for k, v := range cfg.conn {
+		cp[k] = v
+	}
+	return cp
+}
+
+func (cfg *ServerCfg) ConnIter(fn func(string, *wsrpc.Endpoint) error) {
+	var wg sync.WaitGroup
+	for k, ep := range cfg.snapshot() {
+		wg.Add(1)
+		go func(id string, e *wsrpc.Endpoint) {
+			defer wg.Done()
+			if err := fn(id, e); err != nil {
+				// видалити проблемне підключення
+				cfg.connMu.Lock()
+				delete(cfg.conn, id)
+				cfg.connMu.Unlock()
+			}
+		}(k, ep)
+	}
+	wg.Wait()
+}
+
+func (cfg *ServerCfg) Broadcast(fn func(string, *wsrpc.Endpoint) error) {
+	cfg.ConnIter(fn)
+}
+
+func (cfg *ServerCfg) ConnGet(key string) (bool, *wsrpc.Endpoint) {
+	cfg.connMu.RLock()
+	val, ok := cfg.conn[key]
+	cfg.connMu.RUnlock()
+
+	return ok, val
+}
+
+func (cfg *ServerCfg) ConnClose(key string) error {
+	cfg.connMu.RLock()
+	ep, ok := cfg.conn[key]
+	cfg.connMu.RUnlock()
+	if !ok {
+		return nil
+	}
+	// Спочатку закрити
+	if err := ep.Close(); err != nil {
+		return err
+	}
+	// Потім стерти (Serve() теж видалить у своєму defer — подвійне delete безпечний)
+	cfg.connMu.Lock()
+	delete(cfg.conn, key)
+	cfg.connMu.Unlock()
+	return nil
+}
+
+func (cfg *ServerCfg) CloseAll() {
+	var wg sync.WaitGroup
+	for k, ep := range cfg.snapshot() {
+		wg.Add(1)
+		go func(id string, e *wsrpc.Endpoint) {
+			defer wg.Done()
+			_ = e.Close()
+			cfg.connMu.Lock()
+			delete(cfg.conn, id)
+			cfg.connMu.Unlock()
+		}(k, ep)
+	}
+	wg.Wait()
 }
