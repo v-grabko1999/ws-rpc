@@ -6,6 +6,7 @@ import (
 	"log"
 	mrand "math/rand"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -91,19 +92,25 @@ func (cfg *ClientCfg) nextBackoff(attempt int) time.Duration {
 
 func Client(keyID string, cfg *ClientCfg) error {
 	if cfg == nil || cfg.ServerSignPubBase64 == "" {
+		log.Println("[Client] ❌ Некоректна конфігурація: ServerSignPubBase64 порожній")
 		return errors.New("client config: ServerSignPubBase64 required")
 	}
 	cfg.stopped = make(chan struct{}, 1)
 	mrand.Seed(time.Now().UnixNano())
 
 	registry := wsrpc.NewRegistry()
-	for _, s := range cfg.Services {
+	for i, s := range cfg.Services {
 		registry.RegisterService(s)
+		log.Printf("[Client] 🔌 Зареєстровано сервіс #%d\n", i+1)
 	}
 
+	// Підготовка заголовків (логую лише ключі, без значень)
 	h := http.Header{}
-	for k, v := range cfg.HttpHeaders {
-		h.Set(k, v)
+	if n := len(cfg.HttpHeaders); n > 0 {
+		for k, v := range cfg.HttpHeaders {
+			h.Set(k, v)
+		}
+		log.Printf("[Client] 📨 Заголовки до запиту: %v\n", headerKeysOnly(cfg.HttpHeaders))
 	}
 
 	wsScheme := "ws"
@@ -111,18 +118,20 @@ func Client(keyID string, cfg *ClientCfg) error {
 		wsScheme = "wss"
 	}
 	wsURL := fmt.Sprintf("%s://%s/rpc-cryptobuss", wsScheme, strings.TrimPrefix(strings.TrimPrefix(cfg.RpcServerURL, "http://"), "https://"))
+	log.Printf("[Client] 🌐 WebSocket URL: %s (scheme=%s)\n", wsURL, wsScheme)
 
 	attempt := 0
 	var deadline time.Time
 	var lastErr error
+	var sessions uint64 // лічильник сесій підключень
 
 	// локальний хелпер очікування зі всіма перевірками
-	waitOrStop := func(sleep time.Duration) bool {
+	waitOrStop := func(sleep time.Duration, reason string) bool {
 		if !deadline.IsZero() && time.Now().Add(sleep).After(deadline) {
-			// не встигаємо за бюджетом
 			if cfg.OnGiveUp != nil {
 				cfg.OnGiveUp("total-timeout", attempt, lastErr)
 			}
+			log.Printf("[Client] ⏱️ Перевищено загальний бюджет часу перепідключень (%s). Завершую.\n", reason)
 			return false
 		}
 		select {
@@ -130,6 +139,7 @@ func Client(keyID string, cfg *ClientCfg) error {
 			if cfg.OnGiveUp != nil {
 				cfg.OnGiveUp("stopped", attempt, lastErr)
 			}
+			log.Println("[Client] ⏹ Отримано Stop() — вихід")
 			return false
 		case <-time.After(sleep):
 			return true
@@ -140,19 +150,24 @@ func Client(keyID string, cfg *ClientCfg) error {
 		// «м’який» вихід
 		select {
 		case <-cfg.stopped:
+			log.Println("[Client] ⏹ Зупинка запитана до підключення — вихід")
 			return nil
 		default:
 		}
 
-		log.Println("[WebSocket] Попытка подключения к серверу...")
+		log.Printf("[Client] ▶️ Спроба підключення #%d до %s ...\n", attempt+1, wsURL)
 
 		conn, res, err := websocket.DefaultDialer.Dial(wsURL, h)
 		if err != nil {
 			lastErr = err
+			log.Printf("[Client] ❌ Dial error (attempt=%d): %v\n", attempt+1, err)
+
 			// стартуємо вікно TotalRetryTimeout з першого фейлу
 			if attempt == 0 && cfg.TotalRetryTimeout > 0 && deadline.IsZero() {
 				deadline = time.Now().Add(cfg.TotalRetryTimeout)
+				log.Printf("[Client] ⏱️ Старт вікна TotalRetryTimeout: %s\n", cfg.TotalRetryTimeout)
 			}
+
 			// ліміт спроб?
 			if cfg.MaxReconnects > 0 && attempt >= cfg.MaxReconnects {
 				if cfg.OnGiveUp != nil {
@@ -160,15 +175,19 @@ func Client(keyID string, cfg *ClientCfg) error {
 				}
 				return fmt.Errorf("dial failed: %w (max reconnects reached)", err)
 			}
+
 			sleep := cfg.nextBackoff(attempt)
+			log.Printf("[Client] 💤 Backoff перед наступною спробою: %s (attempt=%d)\n", sleep, attempt+1)
+
 			if cfg.OnReconnectAttempt != nil {
 				if !cfg.OnReconnectAttempt(attempt+1, sleep, lastErr) {
+					log.Println("[Client] 🛑 OnReconnectAttempt повернув false — припиняю")
 					cfg.OnGiveUp("max-reconnects", attempt, lastErr)
 					return nil
 				}
 			}
 			attempt++
-			if !waitOrStop(sleep) {
+			if !waitOrStop(sleep, "dial-backoff") {
 				return nil
 			}
 			continue
@@ -177,11 +196,17 @@ func Client(keyID string, cfg *ClientCfg) error {
 		// dial ok → скидаємо лічильники
 		attempt = 0
 		deadline = time.Time{}
+		sessions++
+		log.Printf("[Client] ✅ Dial успішний (session=%d)\n", sessions)
 
+		// Колбек з HTTP-відповіддю (рукостискання)
 		if cfg.OnHttpResponse != nil {
+			log.Printf("[Client] ⇢ OnHttpResponse: status=%s, code=%d\n", res.Status, res.StatusCode)
 			if err = cfg.OnHttpResponse(res); err != nil {
 				lastErr = err
+				log.Printf("[Client] ❌ OnHttpResponse помилка: %v\n", err)
 				_ = conn.Close()
+
 				if cfg.MaxReconnects > 0 && attempt >= cfg.MaxReconnects {
 					if cfg.OnGiveUp != nil {
 						cfg.OnGiveUp("max-reconnects", attempt, lastErr)
@@ -189,30 +214,36 @@ func Client(keyID string, cfg *ClientCfg) error {
 					return fmt.Errorf("OnHttpResponse: %w", err)
 				}
 				sleep := cfg.nextBackoff(attempt)
+				log.Printf("[Client] 💤 Backoff після OnHttpResponse: %s (attempt=%d)\n", sleep, attempt+1)
+
 				if cfg.OnReconnectAttempt != nil {
 					if !cfg.OnReconnectAttempt(attempt+1, sleep, lastErr) {
+						log.Println("[Client] 🛑 OnReconnectAttempt=false після OnHttpResponse — припиняю")
 						cfg.OnGiveUp("max-reconnects", attempt, lastErr)
 						return nil
 					}
-
 				}
 				attempt++
-				if !waitOrStop(sleep) {
+				if !waitOrStop(sleep, "http-response") {
 					return nil
 				}
 				continue
 			}
 		}
 
+		log.Printf("[Client] ⇢ Початок крипто-handshake (session=%d)\n", sessions)
 		sessionKey, err := performClientHandshake(conn, cfg.ServerSignPubBase64, keyID)
 		if err != nil || len(sessionKey) != 32 {
 			if err == nil {
 				err = fmt.Errorf("invalid session key length: %d", len(sessionKey))
 			}
 			lastErr = err
+			log.Printf("[Client] ❌ Handshake failed: %v\n", err)
 			_ = conn.Close()
+
 			if attempt == 0 && cfg.TotalRetryTimeout > 0 && deadline.IsZero() {
 				deadline = time.Now().Add(cfg.TotalRetryTimeout)
+				log.Printf("[Client] ⏱️ Старт TotalRetryTimeout: %s\n", cfg.TotalRetryTimeout)
 			}
 			if cfg.MaxReconnects > 0 && attempt >= cfg.MaxReconnects {
 				if cfg.OnGiveUp != nil {
@@ -221,25 +252,32 @@ func Client(keyID string, cfg *ClientCfg) error {
 				return fmt.Errorf("handshake failed: %w", err)
 			}
 			sleep := cfg.nextBackoff(attempt)
+			log.Printf("[Client] 💤 Backoff після помилки handshake: %s (attempt=%d)\n", sleep, attempt+1)
+
 			if cfg.OnReconnectAttempt != nil {
 				if !cfg.OnReconnectAttempt(attempt+1, sleep, lastErr) {
+					log.Println("[Client] 🛑 OnReconnectAttempt=false після handshake — припиняю")
 					cfg.OnGiveUp("max-reconnects", attempt, lastErr)
 					return nil
 				}
 			}
 			attempt++
-			if !waitOrStop(sleep) {
+			if !waitOrStop(sleep, "handshake") {
 				return nil
 			}
 			continue
 		}
+		log.Printf("[Client] ✅ Handshake успішний (session=%d)\n", sessions)
 
 		endpoint, err := wetsock.NewEndpoint(registry, conn, string(sessionKey))
 		if err != nil {
 			lastErr = err
+			log.Printf("[Client] ❌ NewEndpoint error: %v\n", err)
 			_ = conn.Close()
+
 			if attempt == 0 && cfg.TotalRetryTimeout > 0 && deadline.IsZero() {
 				deadline = time.Now().Add(cfg.TotalRetryTimeout)
+				log.Printf("[Client] ⏱️ Старт TotalRetryTimeout: %s\n", cfg.TotalRetryTimeout)
 			}
 			if cfg.MaxReconnects > 0 && attempt >= cfg.MaxReconnects {
 				if cfg.OnGiveUp != nil {
@@ -248,19 +286,23 @@ func Client(keyID string, cfg *ClientCfg) error {
 				return fmt.Errorf("NewEndpoint: %w", err)
 			}
 			sleep := cfg.nextBackoff(attempt)
+			log.Printf("[Client] 💤 Backoff після NewEndpoint: %s (attempt=%d)\n", sleep, attempt+1)
+
 			if cfg.OnReconnectAttempt != nil {
 				if !cfg.OnReconnectAttempt(attempt+1, sleep, lastErr) {
+					log.Println("[Client] 🛑 OnReconnectAttempt=false після NewEndpoint — припиняю")
 					cfg.OnGiveUp("max-reconnects", attempt, lastErr)
 					return nil
 				}
 			}
 			attempt++
-			if !waitOrStop(sleep) {
+			if !waitOrStop(sleep, "new-endpoint") {
 				return nil
 			}
 			continue
 		}
 
+		log.Printf("[Client] 🔗 Підключено (session=%d). Запускаю Serve() ...\n", sessions)
 		if cfg.OnConnected != nil {
 			cfg.OnConnected(endpoint)
 		}
@@ -268,15 +310,23 @@ func Client(keyID string, cfg *ClientCfg) error {
 		// Блокуємось у Serve() до розриву
 		if err := endpoint.Serve(); err != nil {
 			lastErr = err
+			log.Printf("[Client] ⚠️ Serve завершився з помилкою: %v (session=%d)\n", err, sessions)
 			if cfg.OnDisconnected != nil {
 				cfg.OnDisconnected(err)
 			}
+		} else {
+			log.Printf("[Client] ⏹ Serve завершено без помилок (session=%d)\n", sessions)
+			if cfg.OnDisconnected != nil {
+				cfg.OnDisconnected(nil)
+			}
 		}
 
-		// після розриву — пауза між сесіями (не backoff, а м’який «cooldown»)
+		// після розриву — пауза між сесіями (м’який «cooldown», не backoff)
 		cooldown := 1*time.Second + time.Duration(mrand.Int63n(int64(1000*time.Millisecond)))
+		log.Printf("[Client] 🧊 Cooldown між сесіями: %s\n", cooldown)
 		select {
 		case <-cfg.stopped:
+			log.Println("[Client] ⏹ Stop() під час cooldown — закриваю endpoint і виходжу")
 			_ = endpoint.Close()
 			return nil
 		case <-time.After(cooldown):
@@ -285,16 +335,28 @@ func Client(keyID string, cfg *ClientCfg) error {
 		// при переході до нового циклу перепідключень стартуємо бюджет часу
 		attempt = 0
 		deadline = time.Time{}
+		log.Println("[Client] 🔁 Перехід до нового циклу перепідключень")
 	}
 }
 
 func (cfg *ClientCfg) Stop() {
-	// non-blocking stop so callers don't hang if channel already has a value
 	if cfg == nil || cfg.stopped == nil {
 		return
 	}
 	select {
 	case cfg.stopped <- struct{}{}:
+		log.Println("[Client] ⏹ Stop() надіслано")
 	default:
+		log.Println("[Client] ⏹ Stop() вже був надісланий раніше")
 	}
+}
+
+// Допоміжне: повертає лише перелік ключів заголовків для безпечного логування
+func headerKeysOnly(h map[string]string) []string {
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
