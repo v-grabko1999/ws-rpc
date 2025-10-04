@@ -164,7 +164,7 @@ func Client(keyID string, cfg *ClientCfg) error {
 			if cfg.OnReconnectAttempt != nil {
 				if !cfg.OnReconnectAttempt(attempt+1, sleep, lastErr) {
 					cfg.OnGiveUp("max-reconnects", attempt, lastErr)
-					return fmt.Errorf("користувач відмінив повторні зєднання")
+					return nil
 				}
 			}
 			attempt++
@@ -192,7 +192,7 @@ func Client(keyID string, cfg *ClientCfg) error {
 				if cfg.OnReconnectAttempt != nil {
 					if !cfg.OnReconnectAttempt(attempt+1, sleep, lastErr) {
 						cfg.OnGiveUp("max-reconnects", attempt, lastErr)
-						return fmt.Errorf("користувач відмінив повторні зєднання")
+						return nil
 					}
 
 				}
@@ -224,7 +224,7 @@ func Client(keyID string, cfg *ClientCfg) error {
 			if cfg.OnReconnectAttempt != nil {
 				if !cfg.OnReconnectAttempt(attempt+1, sleep, lastErr) {
 					cfg.OnGiveUp("max-reconnects", attempt, lastErr)
-					return fmt.Errorf("користувач відмінив повторні зєднання")
+					return nil
 				}
 			}
 			attempt++
@@ -251,7 +251,7 @@ func Client(keyID string, cfg *ClientCfg) error {
 			if cfg.OnReconnectAttempt != nil {
 				if !cfg.OnReconnectAttempt(attempt+1, sleep, lastErr) {
 					cfg.OnGiveUp("max-reconnects", attempt, lastErr)
-					return fmt.Errorf("користувач відмінив повторні зєднання")
+					return nil
 				}
 			}
 			attempt++
