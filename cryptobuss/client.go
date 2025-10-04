@@ -40,7 +40,7 @@ type ClientCfg struct {
 	JitterFrac float64
 
 	// Колбеки (необов'язкові)
-	OnReconnectAttempt func(attempt int, sleep time.Duration, lastErr error)
+	OnReconnectAttempt func(attempt int, sleep time.Duration, lastErr error) bool
 	OnConnected        func(endpoint *wsrpc.Endpoint)                  // коли з’єднання встановлено
 	OnDisconnected     func(err error)                                 // коли Serve() завершився
 	OnGiveUp           func(reason string, attempt int, lastErr error) // коли припиняємо спроби
@@ -162,7 +162,10 @@ func Client(keyID string, cfg *ClientCfg) error {
 			}
 			sleep := cfg.nextBackoff(attempt)
 			if cfg.OnReconnectAttempt != nil {
-				cfg.OnReconnectAttempt(attempt+1, sleep, lastErr)
+				if !cfg.OnReconnectAttempt(attempt+1, sleep, lastErr) {
+					cfg.OnGiveUp("max-reconnects", attempt, lastErr)
+					return fmt.Errorf("користувач відмінив повторні зєднання")
+				}
 			}
 			attempt++
 			if !waitOrStop(sleep) {
@@ -187,7 +190,11 @@ func Client(keyID string, cfg *ClientCfg) error {
 				}
 				sleep := cfg.nextBackoff(attempt)
 				if cfg.OnReconnectAttempt != nil {
-					cfg.OnReconnectAttempt(attempt+1, sleep, lastErr)
+					if !cfg.OnReconnectAttempt(attempt+1, sleep, lastErr) {
+						cfg.OnGiveUp("max-reconnects", attempt, lastErr)
+						return fmt.Errorf("користувач відмінив повторні зєднання")
+					}
+
 				}
 				attempt++
 				if !waitOrStop(sleep) {
@@ -215,7 +222,10 @@ func Client(keyID string, cfg *ClientCfg) error {
 			}
 			sleep := cfg.nextBackoff(attempt)
 			if cfg.OnReconnectAttempt != nil {
-				cfg.OnReconnectAttempt(attempt+1, sleep, lastErr)
+				if !cfg.OnReconnectAttempt(attempt+1, sleep, lastErr) {
+					cfg.OnGiveUp("max-reconnects", attempt, lastErr)
+					return fmt.Errorf("користувач відмінив повторні зєднання")
+				}
 			}
 			attempt++
 			if !waitOrStop(sleep) {
@@ -239,7 +249,10 @@ func Client(keyID string, cfg *ClientCfg) error {
 			}
 			sleep := cfg.nextBackoff(attempt)
 			if cfg.OnReconnectAttempt != nil {
-				cfg.OnReconnectAttempt(attempt+1, sleep, lastErr)
+				if !cfg.OnReconnectAttempt(attempt+1, sleep, lastErr) {
+					cfg.OnGiveUp("max-reconnects", attempt, lastErr)
+					return fmt.Errorf("користувач відмінив повторні зєднання")
+				}
 			}
 			attempt++
 			if !waitOrStop(sleep) {
