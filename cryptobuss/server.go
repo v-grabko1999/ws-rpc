@@ -181,7 +181,7 @@ func (cfg *ServerCfg) ConnIter(fn func(string, *wsrpc.Endpoint) error) {
 func (cfg *ServerCfg) Broadcast(fn func(string, *wsrpc.Endpoint) error) {
 	log.Println("[Server] 📣 Broadcast старт")
 	cfg.ConnIter(fn)
-	log.Println("[Server] 📣 Broadcast завершено")
+	log.Println("[Server] 📣 Broadcast завершено ")
 }
 
 func (cfg *ServerCfg) ConnGet(key string) (bool, *wsrpc.Endpoint) {
