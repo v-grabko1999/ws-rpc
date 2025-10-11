@@ -61,7 +61,7 @@ func TestBidirectionalRPC(t *testing.T) {
 		// Создаем серверный endpoint и шлём его в main-гору
 		registry := wsrpc.NewRegistry()
 		registry.RegisterService(&ServerService{})
-		ep, err := wetsock.NewEndpoint(registry, conn, testKey)
+		ep, err := wetsock.NewEndpoint(registry, nil, conn, testKey)
 		if err != nil {
 			t.Fatalf("NewEndpoint failed: %v", err)
 		}

@@ -10,12 +10,18 @@ import (
 )
 
 // NewEndpoint створює Endpoint для WebSocket з увімкненим шифруванням
-func NewEndpoint(registry *wsrpc.Registry, ws *websocket.Conn, keyString string) (*wsrpc.Endpoint, error) {
+func NewEndpoint(registry *wsrpc.Registry, perm *wsrpc.Permission, ws *websocket.Conn, keyString string) (*wsrpc.Endpoint, error) {
 	c, err := NewCodec(ws, keyString)
 	if err != nil {
 		return nil, err
 	}
-	e := wsrpc.NewEndpoint(c, registry)
+	var e *wsrpc.Endpoint
+	if perm != nil {
+		e = wsrpc.NewEndpointWithPerm(c, registry, perm)
+	} else {
+		e = wsrpc.NewEndpoint(c, registry)
+	}
+
 	return e, nil
 }
 

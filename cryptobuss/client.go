@@ -269,7 +269,7 @@ func Client(keyID string, cfg *ClientCfg) error {
 		}
 		log.Printf("[Client] ✅ Handshake успішний (session=%d)\n", sessions)
 
-		endpoint, err := wetsock.NewEndpoint(registry, conn, string(sessionKey))
+		endpoint, err := wetsock.NewEndpoint(registry, nil, conn, string(sessionKey))
 		if err != nil {
 			lastErr = err
 			log.Printf("[Client] ❌ NewEndpoint error: %v\n", err)

@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,23 +18,45 @@ import (
 
 // --- допоміжні сервіси для теста ---
 
-// ServerService розміщується на сервері; у тесті ми змусимо сервер викликати клієнта.
+// ServerService розміщується на сервері.
 type ServerService struct{}
 
+// Дозволений метод — тригер для клієнта.
 func (s *ServerService) CallClient(_ *struct{}, _ *struct{}, ep *wsrpc.Endpoint) error {
 	log.Println("[Server] Клиент вызвал сервер, вызываем ClientFunc на клиенте")
-	// Сервер викликає метод на клієнті
 	var reply struct{}
 	return ep.Call("ClientService.ClientFunc", &struct{}{}, &reply)
 }
 
-// ClientService розміщується на клієнті — закриває done коли викликаний.
-type ClientService struct {
-	Done chan struct{}
+// Існуючий, але ЗАБОРОНЕНИЙ політикою метод.
+// Він потрібен у реєстрі, щоб політика зрізала його ДО виконання.
+func (s *ServerService) CallClientPerm(_ *struct{}, _ *struct{}, ep *wsrpc.Endpoint) error {
+	log.Println("[Server] (forbidden) CallClientPerm був би виконаний, але має бути заблокований політикою")
+	var reply struct{}
+	// Навіть якщо тут щось є — до нас не повинні дійти через deny-list.
+	return ep.Call("ClientService.ClientFunc", &struct{}{}, &reply)
 }
 
-func (c *ClientService) ClientFunc(_ *struct{}, _ *struct{}) error {
-	log.Println("[Client] Сервер вызвал ClientFunc, сигнализируем Done")
+// ClientService розміщується на клієнті — пробує заборонений виклик після сигналу від сервера.
+type ClientService struct {
+	Done         chan struct{}
+	ForbiddenErr chan error
+}
+
+// Тепер маємо доступ до ендпойнта третьим параметром: ep *wsrpc.Endpoint
+func (c *ClientService) ClientFunc(_ *struct{}, _ *struct{}, ep *wsrpc.Endpoint) error {
+	log.Println("[Client] Сервер вызвал ClientFunc — пробуем заборонений виклик на сервері")
+
+	// КЛІЄНТ намагається викликати на СЕРВЕРІ заборонений метод:
+	var reply struct{}
+	err := ep.Call("ServerService.CallClientPerm", &struct{}{}, &reply)
+
+	// Повертаємо у тест отриману помилку:
+	select {
+	case c.ForbiddenErr <- err:
+	default:
+	}
+
 	close(c.Done)
 	return nil
 }
@@ -43,128 +66,134 @@ func (c *ClientService) ClientFunc(_ *struct{}, _ *struct{}) error {
 func TestIntegration_ServerAndClient_PublicAPI(t *testing.T) {
 	var wg sync.WaitGroup
 
-	// канал для отримання server endpoint з handler'а (щоб можемо його коректно закрити)
-	serverEPCh := make(chan *wsrpc.Endpoint, 1)
+	serverEPCh := make(chan *wsrpc.Endpoint, 1) // endpoint сервера назовні
+	clientErrCh := make(chan error, 1)          // помилка/результат клієнта
 
-	// канал для повідомлення про помилку клієнта
-	clientErrCh := make(chan error, 1)
-
-	// сигнал завершення від клієнтського сервісу
 	done := make(chan struct{})
+	forbiddenErrCh := make(chan error, 1)
 
-	// 1) генеруємо Ed25519 ключі (серверний підписний ключ)
+	// 1) Ключі
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate ed25519 key failed: %v", err)
 	}
 	serverPubB64 := base64.StdEncoding.EncodeToString(pub)
 
-	// 2) готуємо ServerCfg
+	// 2) ServerCfg з deny-list
 	serverCfg := &cryptobuss.ServerCfg{
 		SignPriv: priv,
 		KeyID:    "test-key-1",
+		Permission: &wsrpc.Permission{
+			Mode: wsrpc.PermissionDenyList,
+			List: map[string]bool{
+				"ServerService.CallClientPerm": true, // ЗАБОРОНЕНО
+			},
+		},
 		OnRegistry: func(reg *wsrpc.Registry) error {
 			reg.RegisterService(&ServerService{})
 			return nil
 		},
 		OnEndpoint: func(r *http.Request, id string, ep *wsrpc.Endpoint) error {
-			// віддаємо endpoint назовні, щоб тест міг його закрити вкінці
+			// Віддаємо endpoint у тест:
 			select {
 			case serverEPCh <- ep:
 			default:
 			}
 
-			// Також запустимо фонову спробу викликати клієнтський метод —
-			// робимо це з невеликими повторними спробами (щоб уникнути race)
+			// Паралельно пробуємо викликати метод клієнта (щоб гарантовано спрацював ClientFunc)
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				// чекаємо трохи для стабільності з'єднання
 				deadline := time.Now().Add(5 * time.Second)
 				for time.Now().Before(deadline) {
-					// Викликаємо ClientService.ClientFunc (якщо клієнт вже зареєстрував свій сервіс — викличеться)
 					var reply struct{}
-					err := ep.Call("ClientService.ClientFunc", &struct{}{}, &reply)
-					if err == nil {
-						// успіх — більше не намагаємось
+					if err := ep.Call("ClientService.ClientFunc", &struct{}{}, &reply); err == nil {
 						return
 					}
-					// не вдалось — зачекаємо і спробуємо ще
 					time.Sleep(50 * time.Millisecond)
 				}
-				// якщо не вдалось — логнемо
 				t.Logf("[Server] warning: could not call client method within timeout")
 			}()
-
 			return nil
 		},
 	}
 
-	// 3) піднімаємо httptest сервер
+	// 3) HTTP test server
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Викликаємо ваш public Server API всередині handler'а
-		err := cryptobuss.Server(serverCfg, w, r)
-		if err != nil {
-			// Якщо Server повернув помилку — лог і завершення тесту
+		if err := cryptobuss.Server(serverCfg, w, r); err != nil {
 			t.Fatalf("cryptobuss.Server returned error: %v", err)
 		}
 	}))
 	defer srv.Close()
 
-	// 4) Підготуємо клієнтську конфігурацію
+	// 4) ClientCfg
 	clientCfg := &cryptobuss.ClientCfg{
 		HttpHeaders:         map[string]string{},
-		Services:            []interface{}{&ClientService{Done: done}},
-		RpcServerURL:        srv.URL, // Client побудує ws://.../rpc сам
+		Services:            []interface{}{&ClientService{Done: done, ForbiddenErr: forbiddenErrCh}},
+		RpcServerURL:        srv.URL,
 		ServerSignPubBase64: serverPubB64,
 		OnHttpResponse:      nil,
 	}
 
-	// 5) Запустимо клієнт у горутині
+	// 5) Старт клієнта
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		err := cryptobuss.Client("test-key-1", clientCfg)
-		// Client зазвичай завершується при cfg.Stop() — сюди повернеться nil або помилка
 		clientErrCh <- err
 	}()
 
-	// Невелика пауза — даємо клієнту піднятися і встановити handshake (робоча страховка)
+	// Невелика пауза на handshake
 	time.Sleep(100 * time.Millisecond)
 
-	// 6) Чекаємо сигналу від client service (сервер має викликати його через ep.Call)
+	// 6) Чекаємо, поки клієнт відпрацює ClientFunc і спробує заборонений виклик
 	select {
 	case <-done:
-		// усе OK
+		// ок
 	case <-time.After(5 * time.Second):
 		t.Fatalf("timeout waiting for client service to be called")
 	}
 
-	// 7) Коректно завершуємо клієнта і сервер
-	// Спочатку закриваємо серверний endpoint (щоб client.Serve() повернувся)
+	// 6.1) Читаємо результат спроби забороненого виклику
+	select {
+	case ferr := <-forbiddenErrCh:
+		if ferr == nil {
+			t.Errorf("очікувалась помилка доступу при виклику ServerService.CallClientPerm, але помилки немає")
+		} else {
+			em := strings.ToLower(ferr.Error())
+			// Дозволяємо кілька узгоджених формулювань помилки
+			if !(strings.Contains(em, "forbidden") ||
+				strings.Contains(em, "not permitted") ||
+				strings.Contains(em, "permission")) {
+				t.Errorf("неочікуваний тип помилки для забороненого виклику: %v", ferr)
+			} else {
+				t.Logf("заборонений виклик повернув очікувану помилку: %v", ferr)
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting forbidden call result from client")
+	}
+
+	// 7) Коректне завершення: один раз отримуємо endpoint та закриваємо
 	var serverEP *wsrpc.Endpoint
 	select {
 	case serverEP = <-serverEPCh:
-		// якщо маємо endpoint — закриваємо його, це розірве з'єднання з клієнтом
 		if serverEP != nil {
 			if err := serverEP.Close(); err != nil {
 				t.Logf("serverEP.Close error: %v", err)
 			}
 		}
 	case <-time.After(500 * time.Millisecond):
-		// якщо endpoint ми не отримали — закриємо сам httptest сервер, що також розірве коннекшени
 		t.Log("server endpoint not received quickly; closing test server to force client disconnect")
-		// srv.Close() викличе defer та розірве коннекшени
-		// але оскільки srv вищезадекларований в тесті і буде закритий у defer,
-		// тут можна додатково викликати srv.Close() тільки якщо доступно в скоупі.
 	}
 
-	// Тепер, коли серверна сторона розірвала з'єднання, client.Serve() має повернутися
-	// і цикл Client() зможе обробити сигнал stopped. Тепер викликаємо Stop().
-	// Stop() блокує до тих пір, поки в goroutine Client() не прочитає зі свого каналу.
+	// Невелика пауза, щоб клієнт вийшов із Serve()
+	time.Sleep(50 * time.Millisecond)
+
+	// Зупинка клієнта
 	clientCfg.Stop()
 
-	// 8) Чекаємо, поки client goroutine поверне результат
+	// 8) Чекаємо завершення клієнта
 	select {
 	case cerr := <-clientErrCh:
 		if cerr != nil {
@@ -174,6 +203,6 @@ func TestIntegration_ServerAndClient_PublicAPI(t *testing.T) {
 		t.Fatalf("timeout waiting for Client to stop after server closed connection")
 	}
 
-	// 9) Зачекаємо завершення goroutine'ів, запущених у handler'і
+	// 9) Дочікуємося бекграундних горутин
 	wg.Wait()
 }

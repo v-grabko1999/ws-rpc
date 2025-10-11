@@ -51,7 +51,7 @@ func (ae *AutoEndpoint) connect() error {
 	if err != nil {
 		return fmt.Errorf("dial ws: %w", err)
 	}
-	ep, err := NewEndpoint(ae.registry, ws, ae.key)
+	ep, err := NewEndpoint(ae.registry, nil, ws, ae.key)
 	if err != nil {
 		ws.Close()
 		return err

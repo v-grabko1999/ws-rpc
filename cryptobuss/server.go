@@ -19,6 +19,8 @@ type ServerCfg struct {
 	SignPriv ed25519.PrivateKey
 	KeyID    string
 
+	Permission *wsrpc.Permission
+
 	OnRegistry func(reg *wsrpc.Registry) error
 
 	OnEndpoint func(*http.Request, string, *wsrpc.Endpoint) error
@@ -94,7 +96,7 @@ func Server(cfg *ServerCfg, w http.ResponseWriter, r *http.Request) error {
 	}
 
 	// 3) Створюємо Endpoint
-	endpoint, err := wetsock.NewEndpoint(registry, conn, string(sessionKey))
+	endpoint, err := wetsock.NewEndpoint(registry, cfg.Permission, conn, string(sessionKey))
 	if err != nil {
 		cfg.Log("[Server] ❌ Помилка створення Endpoint: %v\n", err)
 		_ = conn.Close()
@@ -102,6 +104,7 @@ func Server(cfg *ServerCfg, w http.ResponseWriter, r *http.Request) error {
 	}
 	id := uuid.NewString()
 	cfg.Log("[Server] ✅ Endpoint створено: id=%s\n", id)
+	cfg.Log("[Server] ✅ Endpoint methods: %s\n", registry.GetFunctionsName())
 
 	// Зберігаємо підключення в індексі (раніше бракувало цього кроку)
 	cfg.connMu.Lock()
