@@ -21,7 +21,6 @@ type ServerCfg struct {
 
 	registryCache *wsrpc.Registry
 	regOnce       sync.Once
-	Permission    *wsrpc.Permission
 
 	OnRegistry func(reg *wsrpc.Registry) error
 
@@ -36,7 +35,7 @@ type ServerCfg struct {
 // Server виконує websocket-апгрейд, крипто-handshake, створює Endpoint і САМ запускає Serve().
 // OnEndpoint викликається вже після створення endpoint (і після старту Serve()),
 // тож у колбеку НЕ потрібно викликати Serve() вдруге.
-func Server(cfg *ServerCfg, w http.ResponseWriter, r *http.Request) error {
+func Server(cfg *ServerCfg, perm *wsrpc.Permission, w http.ResponseWriter, r *http.Request) error {
 	if cfg == nil {
 		return errors.New("server config is nil")
 	}
@@ -108,7 +107,7 @@ func Server(cfg *ServerCfg, w http.ResponseWriter, r *http.Request) error {
 	}
 
 	// 3) Створюємо Endpoint
-	endpoint, err := wetsock.NewEndpoint(cfg.registryCache, cfg.Permission, conn, string(sessionKey))
+	endpoint, err := wetsock.NewEndpoint(cfg.registryCache, perm, conn, string(sessionKey))
 	if err != nil {
 		cfg.Log("[Server] ❌ Помилка створення Endpoint: %v\n", err)
 		_ = conn.Close()

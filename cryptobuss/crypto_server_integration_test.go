@@ -83,12 +83,7 @@ func TestIntegration_ServerAndClient_PublicAPI(t *testing.T) {
 	serverCfg := &cryptobuss.ServerCfg{
 		SignPriv: priv,
 		KeyID:    "test-key-1",
-		Permission: &wsrpc.Permission{
-			Mode: wsrpc.PermissionDenyList,
-			List: map[string]bool{
-				"ServerService.CallClientPerm": true, // ЗАБОРОНЕНО
-			},
-		},
+
 		OnRegistry: func(reg *wsrpc.Registry) error {
 			reg.RegisterService(&ServerService{})
 			return nil
@@ -120,7 +115,12 @@ func TestIntegration_ServerAndClient_PublicAPI(t *testing.T) {
 
 	// 3) HTTP test server
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := cryptobuss.Server(serverCfg, w, r); err != nil {
+		if err := cryptobuss.Server(serverCfg, &wsrpc.Permission{
+			Mode: wsrpc.PermissionDenyList,
+			List: map[string]bool{
+				"ServerService.CallClientPerm": true, // ЗАБОРОНЕНО
+			},
+		}, w, r); err != nil {
 			t.Fatalf("cryptobuss.Server returned error: %v", err)
 		}
 	}))
