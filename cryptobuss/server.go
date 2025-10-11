@@ -19,7 +19,9 @@ type ServerCfg struct {
 	SignPriv ed25519.PrivateKey
 	KeyID    string
 
-	Permission *wsrpc.Permission
+	registryCache *wsrpc.Registry
+	regOnce       sync.Once
+	Permission    *wsrpc.Permission
 
 	OnRegistry func(reg *wsrpc.Registry) error
 
@@ -35,13 +37,15 @@ type ServerCfg struct {
 // OnEndpoint викликається вже після створення endpoint (і після старту Serve()),
 // тож у колбеку НЕ потрібно викликати Serve() вдруге.
 func Server(cfg *ServerCfg, w http.ResponseWriter, r *http.Request) error {
-	if cfg == nil || cfg.SignPriv == nil || len(cfg.SignPriv) == 0 || cfg.KeyID == "" {
-		cfg.Log("[Server] ❌ Некоректна конфігурація: відсутній SignPriv або KeyID")
-		return errors.New("server config incomplete: SignPriv and KeyID required")
+	if cfg == nil {
+		return errors.New("server config is nil")
 	}
-
 	if cfg.Log == nil {
 		cfg.Log = log.Printf
+	}
+	if len(cfg.SignPriv) == 0 || cfg.KeyID == "" {
+		cfg.Log("[Server] ❌ Некоректна конфігурація: відсутній SignPriv або KeyID")
+		return errors.New("server config incomplete: SignPriv and KeyID required")
 	}
 
 	if cfg.conn == nil {
@@ -81,22 +85,30 @@ func Server(cfg *ServerCfg, w http.ResponseWriter, r *http.Request) error {
 	}
 	cfg.Log("[Server] ✅ Handshake успішний, ключ сесії отримано")
 
-	// 2) Реєструємо сервіси
-	registry := wsrpc.NewRegistry()
-	if cfg.OnRegistry != nil {
-		cfg.Log("[Server] ⇢ Виклик OnRegistry()")
-		if err := cfg.OnRegistry(registry); err != nil {
-			cfg.Log("[Server] ❌ OnRegistry помилка: %v\n", err)
-			_ = conn.Close()
-			return err
+	// 2) Реєструємо сервіси (одноразово)
+
+	cfg.regOnce.Do(func() {
+		registry := wsrpc.NewRegistry()
+		if cfg.OnRegistry != nil {
+			cfg.Log("[Server] ⇢ Виклик OnRegistry()")
+			if err := cfg.OnRegistry(registry); err != nil {
+				cfg.Log("[Server] ❌ OnRegistry помилка: %v", err)
+			} else {
+				cfg.Log("[Server] ✅ OnRegistry завершився успішно")
+			}
+		} else {
+			cfg.Log("[Server] ℹ️ OnRegistry не задано (продовжуємо з порожнім реєстром)")
 		}
-		cfg.Log("[Server] ✅ OnRegistry завершився успішно")
-	} else {
-		cfg.Log("[Server] ℹ️ OnRegistry не задано (продовжуємо з порожнім реєстром)")
+		cfg.Log("[Server] ✅ Endpoint methods: %s", registry.GetFunctionsName())
+		cfg.registryCache = registry
+	})
+	if cfg.registryCache == nil {
+		_ = conn.Close()
+		return errors.New("registry initialization failed")
 	}
 
 	// 3) Створюємо Endpoint
-	endpoint, err := wetsock.NewEndpoint(registry, cfg.Permission, conn, string(sessionKey))
+	endpoint, err := wetsock.NewEndpoint(cfg.registryCache, cfg.Permission, conn, string(sessionKey))
 	if err != nil {
 		cfg.Log("[Server] ❌ Помилка створення Endpoint: %v\n", err)
 		_ = conn.Close()
@@ -104,7 +116,6 @@ func Server(cfg *ServerCfg, w http.ResponseWriter, r *http.Request) error {
 	}
 	id := uuid.NewString()
 	cfg.Log("[Server] ✅ Endpoint створено: id=%s\n", id)
-	cfg.Log("[Server] ✅ Endpoint methods: %s\n", registry.GetFunctionsName())
 
 	// Зберігаємо підключення в індексі (раніше бракувало цього кроку)
 	cfg.connMu.Lock()
